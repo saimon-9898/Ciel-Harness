@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v -q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["orchestrator"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+
+[tool.ruff.format]
+line-ending = "auto"
