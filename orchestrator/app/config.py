@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     environment: str = "development"
     log_level: str = "INFO"
     database_url: str = "sqlite:///./data/orchestrator.db"
+    # Root directory for per-project workspaces (e.g. projects/). This is
+    # server configuration, never an API parameter.
+    workspaces_root: str = "projects"
     host: str = "0.0.0.0"
     port: int = 8000
 

@@ -21,6 +21,10 @@ data/*
 logs/*
 !logs/.gitkeep
 
+# Runtime project workspaces
+projects/*
+!projects/.gitkeep
+
 # Test / tooling caches
 .pytest_cache/
 .ruff_cache/

@@ -15,10 +15,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application code.
 COPY app ./app
 
-# Run as an unprivileged user. The host ./data directory is bind-mounted to
-# /app/data by docker-compose so the database file persists on the host.
+# Run as an unprivileged user. The host ./data and ./projects directories are
+# bind-mounted to /app/data and /app/projects by docker-compose so the
+# database file and project workspaces persist on the host.
 RUN useradd --create-home --uid 1000 appuser \
-    && mkdir -p /app/data /app/logs \
+    && mkdir -p /app/data /app/logs /app/projects \
     && chown -R appuser:appuser /app
 
 USER appuser

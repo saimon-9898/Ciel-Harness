@@ -11,9 +11,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .config import settings
+from .api import router as projects_router
+from .config import get_settings, settings
 from .db import dispose_engine, init_db
 from .logging_config import setup_logging
+from .workspaces import WorkspaceService
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +34,10 @@ async def lifespan(_: FastAPI):
     )
     try:
         init_db()
+        WorkspaceService(get_settings().workspaces_root).ensure_root()
     except Exception:
         logger.exception(
-            "database initialization failed",
+            "application initialization failed",
             extra={"database_url": settings.database_url},
         )
         raise
@@ -47,9 +50,11 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="Backend foundation for orchestrating coding agents (Phase 1).",
+    description="Backend foundation for orchestrating coding agents (Phase 2).",
     lifespan=lifespan,
 )
+
+app.include_router(projects_router)
 
 
 @app.exception_handler(Exception)

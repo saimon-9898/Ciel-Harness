@@ -47,7 +47,7 @@ def init_db() -> None:
 
 def get_session() -> Generator[Session, None, None]:
     """FastAPI dependency that yields a database session and closes it."""
-    session = get_session_factory()
+    session = get_session_factory()()
     try:
         yield session
     finally:

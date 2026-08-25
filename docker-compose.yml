@@ -9,10 +9,12 @@ services:
       DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/orchestrator.db}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      WORKSPACES_ROOT: ${WORKSPACES_ROOT:-/app/projects}
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      - ./projects:/app/projects
     healthcheck:
       test:
         [
