@@ -1,7 +1,9 @@
-"""Projects API router (Phase 2).
+"""Projects and Tasks API routers (Phase 2/3).
 
-Exposes project management endpoints. Workspaces are created eagerly on
+Projects (Phase 2): management endpoints; workspaces are created eagerly on
 project creation; the WorkspaceService guarantees filesystem isolation.
+Tasks (Phase 3): task engine endpoints; all status changes are guarded by the
+deterministic state machine.
 """
 
 import logging
@@ -14,8 +16,18 @@ from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .db import get_session
-from .models import Project
-from .schemas import ProjectCreate, ProjectOut
+from .models import Project, Task
+from .schemas import ProjectCreate, ProjectOut, TaskCreate, TaskOut
+from .task_service import (
+    InvalidParentTaskError,
+    ParentTaskNotFoundError,
+    ProjectNotFoundError,
+    TaskError,
+    TaskNotFoundError,
+    TaskService,
+    TaskStateConflictError,
+)
+from .task_states import TaskStateError
 from .workspaces import WorkspaceError, WorkspaceService
 
 logger = logging.getLogger(__name__)
@@ -115,3 +127,131 @@ def list_projects(session: Session = Depends(get_session)) -> list[Project]:
 def get_project(project_id: uuid.UUID, session: Session = Depends(get_session)) -> Project:
     """Fetch a single project by id."""
     return _get_project_or_404(session, project_id)
+
+
+@router.get(
+    "/{project_id}/tasks",
+    response_model=list[TaskOut],
+    responses={
+        "404": {"description": "Project not found"},
+        "422": {"description": "Validation error"},
+    },
+)
+def list_project_tasks(
+    project_id: uuid.UUID, session: Session = Depends(get_session)
+) -> list[Task]:
+    """List all tasks of one project, ordered by creation time then id.
+
+    Scoped strictly to ``project_id``: tasks of other projects are never
+    returned from this endpoint.
+    """
+    _get_project_or_404(session, project_id)
+    return list(
+        session.scalars(
+            select(Task).where(Task.project_id == project_id).order_by(Task.created_at, Task.id)
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tasks router (Phase 3)
+# ---------------------------------------------------------------------------
+
+tasks_router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+_TASK_ERROR_RESPONSES = {
+    404: {"description": "Task or parent task not found"},
+    409: {
+        "description": (
+            "Invalid relationship or state conflict "
+            "(cross-project parent, cycle, invalid/terminal transition, "
+            "or concurrent state change)"
+        )
+    },
+    422: {"description": "Validation error"},
+}
+
+
+def _task_service() -> TaskService:
+    return TaskService()
+
+
+def _task_http_error(exc: Exception) -> HTTPException:
+    """Map Task engine errors to their HTTP status."""
+    if isinstance(exc, ProjectNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    if isinstance(exc, TaskNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    if isinstance(exc, ParentTaskNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Parent task not found")
+    if isinstance(exc, (InvalidParentTaskError, TaskStateConflictError, TaskStateError)):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+
+@tasks_router.post(
+    "",
+    response_model=TaskOut,
+    status_code=status.HTTP_201_CREATED,
+    responses=_TASK_ERROR_RESPONSES,
+)
+def create_task(
+    payload: TaskCreate,
+    session: Session = Depends(get_session),
+    tasks: TaskService = Depends(_task_service),
+) -> Task:
+    """Create a task in state CREATED under an existing project.
+
+    Only creation fields are accepted; status, timestamps, result, error and
+    agent_id are server-controlled.
+    """
+    try:
+        return tasks.create_task(
+            session,
+            project_id=payload.project_id,
+            parent_task_id=payload.parent_task_id,
+            objective=payload.objective,
+            instructions=payload.instructions,
+            constraints=payload.constraints,
+            success_criteria=payload.success_criteria,
+        )
+    except (TaskError, TaskStateError) as exc:
+        raise _task_http_error(exc) from exc
+
+
+@tasks_router.get(
+    "/{task_id}",
+    response_model=TaskOut,
+    responses={
+        "404": _TASK_ERROR_RESPONSES[404],
+        "422": _TASK_ERROR_RESPONSES[422],
+    },
+)
+def get_task(task_id: uuid.UUID, session: Session = Depends(get_session)) -> Task:
+    """Fetch a single task by id."""
+    task = session.get(Task, task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    return task
+
+
+@tasks_router.post(
+    "/{task_id}/cancel",
+    response_model=TaskOut,
+    responses=_TASK_ERROR_RESPONSES,
+)
+def cancel_task(
+    task_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    tasks: TaskService = Depends(_task_service),
+) -> Task:
+    """Cancel a task through the state machine.
+
+    Cancellation is idempotent for already-cancelled tasks (200, state
+    unchanged). COMPLETED and FAILED tasks are terminal: cancellation is
+    rejected with 409 and never silently rewrites terminal state.
+    """
+    try:
+        return tasks.cancel_task(session, task_id)
+    except (TaskError, TaskStateError) as exc:
+        raise _task_http_error(exc) from exc

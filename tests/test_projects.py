@@ -340,7 +340,15 @@ def test_create_project_commit_race_returns_409_and_cleans_workspace(client, mon
 def test_openapi_schema_exposes_all_routes(client):
     c, _, _ = client
     schema = c.get("/openapi.json").json()
-    assert set(schema["paths"]) == {"/health", "/projects", "/projects/{project_id}"}
+    assert set(schema["paths"]) == {
+        "/health",
+        "/projects",
+        "/projects/{project_id}",
+        "/tasks",
+        "/tasks/{task_id}",
+        "/tasks/{task_id}/cancel",
+        "/projects/{project_id}/tasks",
+    }
     assert "post" in schema["paths"]["/projects"]
     assert "get" in schema["paths"]["/projects"]
     assert "get" in schema["paths"]["/projects/{project_id}"]

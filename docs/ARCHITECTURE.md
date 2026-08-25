@@ -8,7 +8,7 @@
 │                                                      │
 │  ┌──────────────┐     ┌───────────────────────────┐  │
 │  │   Dashboard   │     │      Orchestrator API      │  │
-│  │  (Phase 3+)   │────▶│  (FastAPI, this project)   │  │
+│  │  (Phase 4+)   │────▶│  (FastAPI, this project)   │  │
 │  └──────────────┘     │                            │  │
 │                       │  - Configuration (env)      │  │
 │                       │  - Structured logging       │  │
@@ -17,18 +17,21 @@
 │                       │  - /health endpoint         │  │
 │                       │  - Projects CRUD (Phase 2)  │  │
 │                       │  - Workspace isolation      │  │
+│                       │  - Task engine (Phase 3)    │  │
 │                       └───────┬────────────────────┘  │
 │                               │                      │
 │                       ┌───────▼────────────────────┐  │
 │                       │    Coding Agents            │  │
-│                       │  (OpenHands, etc. Phase 3+) │  │
+│                       │  (OpenHands, etc. Phase 4+) │  │
 │                       └────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
 ```
 
 **Phase 1** delivered the Orchestrator API box minus projects/workspaces.
-**Phase 2** adds project management and workspace isolation.
-No dashboard, no agent execution, no autonomous behaviour.
+**Phase 2** added project management and workspace isolation.
+**Phase 3** adds the Task engine: a deterministic task state machine with
+creation, querying, and cancellation. No agent execution exists yet.
+No dashboard, no autonomous behaviour.
 
 ---
 
@@ -198,17 +201,152 @@ not race-free against concurrent symlink swaps.
   multi-user access and agent-driven file writes make the attack surface
   real; revisit before adding any endpoint that writes caller-supplied paths.
 
-### 8. API layer (`orchestrator/app/main.py`)
+---
+
+## 8. Task engine
+
+**Phase 3 scope:** the Task engine manages task lifecycle data only. There is
+**no agent execution** — nothing runs a task, and no agent is invoked. Tasks
+are created, queried, transitioned through a deterministic state machine, and
+cancelled.
+
+### 8.1 Task model (`orchestrator/app/models.py`)
+
+```python
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[uuid.UUID]            # primary key, server-generated
+    project_id: Mapped[uuid.UUID]    # FK -> projects.id (CASCADE)
+    parent_task_id: Mapped[uuid.UUID | None]  # self-FK -> tasks.id (SET NULL)
+    objective: Mapped[str]           # required, <= 1000 chars
+    instructions: Mapped[str | None] # optional, <= 4000 chars
+    constraints: Mapped[list[str] | None]      # JSON, <= 50 items, <= 500 chars each
+    success_criteria: Mapped[list[str] | None] # JSON, same bounds
+    status: Mapped[str]              # default CREATED
+    agent_id: Mapped[uuid.UUID | None]  # reserved; never set by the API
+    result: Mapped[str | None]       # reserved; never set by the API
+    error: Mapped[str | None]        # set by fail transitions (internal)
+    created_at / updated_at / started_at / completed_at: datetime
+```
+
+- `project_id` has `ON DELETE CASCADE`; `parent_task_id` has `ON DELETE SET
+  NULL`, so deleting a project removes its tasks and children are never
+  orphaned.
+- The JSON columns are SQLAlchemy `JSON` types, portable to PostgreSQL.
+
+### 8.2 State machine (`orchestrator/app/task_states.py`)
+
+Ten named states exactly as specified:
+
+```
+CREATED, PLANNED, QUEUED, RUNNING, WAITING_FOR_AGENT,
+WAITING_FOR_REVIEW, WAITING_FOR_APPROVAL, COMPLETED, FAILED, CANCELLED
+```
+
+Transition table:
+
+```
+CREATED            -> PLANNED, CANCELLED
+PLANNED            -> QUEUED, CANCELLED
+QUEUED             -> RUNNING, CANCELLED
+RUNNING            -> WAITING_FOR_AGENT, FAILED, CANCELLED
+WAITING_FOR_AGENT  -> RUNNING, WAITING_FOR_REVIEW, FAILED, CANCELLED
+WAITING_FOR_REVIEW -> COMPLETED, WAITING_FOR_APPROVAL, FAILED, CANCELLED
+WAITING_FOR_APPROVAL -> RUNNING, FAILED, CANCELLED
+COMPLETED / FAILED / CANCELLED -> (terminal; no outgoing edges)
+```
+
+One deliberate addition to the specified list:
+`WAITING_FOR_REVIEW -> WAITING_FOR_APPROVAL`, so that `WAITING_FOR_APPROVAL`
+is reachable (the specification used it only as a source state). This is
+documented as a known limitation/decision.
+
+`task_states.py` exposes `validate_transition(current, new)` (raises
+`TaskStateError`), `allowed_transitions(state)`, `is_terminal(state)`, and
+`can_cancel(state)`. The module is pure — no database dependency.
+
+### 8.3 Task service (`orchestrator/app/task_service.py`)
+
+`TaskService` implements the engine:
+
+- **`create_task`** — validates the project exists, validates the parent
+  (exists, same project, not self, no ancestor cycle), then creates a task in
+  `CREATED` with a fresh server-generated UUID. All other fields are
+  server-controlled.
+- **Transition methods** (`plan_task`, `queue_task`, `start_task`,
+  `wait_for_agent`, `resume_task`, `submit_for_review`, `request_approval`,
+  `approve_task`, `complete_task`, `fail_task`, `cancel_task`) all funnel into
+  **`_transition`**, which:
+
+  1. loads the task,
+  2. calls `validate_transition(current, new)`,
+  3. runs a **compare-and-swap** UPDATE:
+     `UPDATE tasks SET status=:new, updated_at=:now WHERE id=:id AND status=:expected`,
+  4. if `rowcount == 0`, raises `TaskStateConflictError` (someone else
+     transitioned concurrently) — the DB, not a Python lock, is the arbiter.
+
+- **`cancel_task`** is idempotent for an already-cancelled task (returns the
+  task, `200`) and rejects terminal tasks (`409`). This keeps duplicate
+  cancels safe without client-side dedup state.
+- Custom exceptions: `TaskNotFoundError`, `ProjectNotFoundError`,
+  `ParentTaskNotFoundError`, `InvalidParentTaskError`,
+  `TaskStateConflictError` (service layer) and `TaskStateError` (state
+  machine).
+
+### 8.4 Tasks API (`orchestrator/app/api.py`)
+
+| Endpoint                       | Method | Success | Errors                              |
+|--------------------------------|--------|---------|-------------------------------------|
+| `/tasks`                       | POST   | 201     | 404 (project), 409 (parent/cycle), 422 (validation) |
+| `/tasks/{task_id}`             | GET    | 200     | 404, 422                            |
+| `/projects/{project_id}/tasks` | GET    | 200     | 404 (project), 422                  |
+| `/tasks/{task_id}/cancel`      | POST   | 200     | 404, 409 (terminal/conflict), 422   |
+
+- `TaskCreate` accepts **only** `project_id`, `parent_task_id`, `objective`,
+  `instructions`, `constraints`, `success_criteria`. Extra keys (including
+  `status`, `result`, `agent_id`, timestamps) are ignored by Pydantic —
+  **mass-assignment protection** is enforced by construction: the schema has
+  no such fields, so they can never be set through the API.
+- There is **no PUT/PATCH** for tasks. Status changes are only possible
+  through the state machine, and only `cancel` is exposed over HTTP in Phase
+  3.
+- Error mapping: 404 for missing resources, 409 for invalid parents,
+  terminal-state cancels, and CAS conflicts, 422 for malformed input, 500 as
+  an unhandled fallback. Every status is declared in OpenAPI
+  (`_TASK_ERROR_RESPONSES`) and verified by contract tests.
+
+### 8.5 Concurrency
+
+SQLite serializes writers, but the CAS UPDATE remains correct on any
+database, including PostgreSQL: two concurrent transitions of the same task
+both execute, and exactly one matches `WHERE status = :expected`; the loser
+observes `rowcount == 0` and returns `409`. No application-level lock is
+held. Tests exercise this with real threads racing cancel-vs-fail and
+duplicate cancels.
+
+### 8.6 Audit hooks
+
+Task transitions log a structured `task transition` event (task id, project
+id, from/to status). This is the minimum hook for the Phase 9 event system;
+no event table or pub/sub exists yet.
+
+---
+
+## 9. API layer (`orchestrator/app/main.py`)
 
 | Endpoint   | Method | Description            |
 |------------|--------|------------------------|
 | `/health`  | GET    | Liveness probe         |
 
+The router include list is: `projects_router` (Phase 2) and `tasks_router`
+(Phase 3).
+
 **Error handling:** A global `Exception` handler catches unhandled
 exceptions, logs them with structured logging, and returns a JSON 500
 response.
 
-### 9. Application lifecycle
+### 9.1 Application lifecycle
 
 Startup:
 1. Configure structured logging.
@@ -218,7 +356,7 @@ Startup:
 Shutdown:
 1. Dispose the SQLAlchemy engine (close the connection pool).
 
-### 10. Docker
+### 9.2 Docker
 
 - **`orchestrator/Dockerfile`** builds a `python:3.12-slim` image. The app
   runs as an unprivileged user (`appuser`, uid 1000). `/app/data`,
@@ -228,7 +366,7 @@ Shutdown:
   fetches `/health` with Python's `urllib`. Environment variables are
   configurable via `.env` and docker-compose `${VAR:-default}` substitution.
 
-### 11. Security
+### 9.3 Security
 
 - The container runs as a non-root user.
 - The host filesystem mount is restricted to `./data` and `./projects`.
@@ -238,6 +376,9 @@ Shutdown:
 - Project names are validated by regex before becoming filesystem paths.
 - The `WorkspaceService` is the single chokepoint for all filesystem access
   and enforces path containment with `Path.resolve()` + `relative_to()`.
+- Task fields that control lifecycle (`status`, `result`, `agent_id`,
+  timestamps) cannot be written through the API — `TaskCreate` simply has no
+  such fields (mass-assignment protection by construction).
 
 ---
 
@@ -250,8 +391,8 @@ OpenHands provides:
 - **Software Agent SDK:** Python and REST APIs for building agents that work
   with code. See https://docs.openhands.dev/sdk
 
-Phase 3+ will integrate one or both of these interfaces. No OpenHands
-dependency is installed in Phase 2.
+Phase 4+ will integrate one or both of these interfaces. No OpenHands
+dependency is installed in Phase 3.
 
 ---
 
@@ -262,19 +403,30 @@ dependency is installed in Phase 2.
    `postgresql+psycopg://user:password@host:5432/orchestrator`.
 3. Remove the SQLite-specific `check_same_thread` connect_args (the engine
    creation logic already handles this via URL prefix detection).
-4. No code changes are needed — SQLAlchemy handles dialect differences.
+4. No code changes are needed — SQLAlchemy handles dialect differences. The
+   Task engine's CAS UPDATE is dialect-neutral.
 
 ---
 
 ## Known limitations
 
 - Docker is not available on the current development machine, so
-  containerised verification was not performed.
+  containerised verification was not performed; the Dockerfile layout was
+  validated by running the app from an identical local layout with `uvicorn`.
 - The database layer is synchronous; an async engine (e.g. `aiosqlite`) can
   be added later if needed for high-concurrency scenarios.
 - No migration tool (Alembic) is configured yet — tables are created via
   `Base.metadata.create_all()`. Alembic should be introduced when models are
   added.
+- The Task engine exposes only creation, listing, reading, and cancellation
+  over HTTP. The full state machine is exercised internally by the service
+  layer and covered by tests; agent execution that would drive those
+  transitions is out of scope for Phase 3.
+- `WAITING_FOR_APPROVAL` is reachable via the single added edge
+  `WAITING_FOR_REVIEW -> WAITING_FOR_APPROVAL` (see section 8.2).
+- Self-parent and cycle relationships cannot be formed through the Phase 3
+  API (no task-update endpoint); `TaskService` still validates and rejects
+  them, and tests cover the guards directly.
 - Workspace path checks have a TOCTOU gap (symlink swaps between resolution
   and use). Documented in detail in section 7; acceptable for single-user
   operation and mitigated by post-mkdir re-verification. Revisit before
