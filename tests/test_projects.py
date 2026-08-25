@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from app.config import get_settings
-from app.db import get_session_factory
+from app.db import get_engine, get_session_factory
 from app.models import Project
 from app.workspaces import WorkspaceError, WorkspaceService
 
@@ -295,3 +295,51 @@ def test_openapi_schema_exposes_all_routes(client):
     assert "get" in schema["paths"]["/projects"]
     assert "get" in schema["paths"]["/projects/{project_id}"]
     assert "get" in schema["paths"]["/health"]
+
+
+# ---------- database schema and constraints ----------
+
+
+def test_projects_table_schema(client):
+    """The projects table must map every model field with a UUID PK and a unique name."""
+    from sqlalchemy import inspect
+
+    _, _, _ = client
+    inspector = inspect(get_engine())
+    columns = {c["name"]: c for c in inspector.get_columns("projects")}
+    assert set(columns) == {
+        "id",
+        "name",
+        "repository_url",
+        "repository_path",
+        "default_branch",
+        "status",
+        "created_at",
+        "updated_at",
+    }
+    pk = inspector.get_pk_constraint("projects")
+    assert pk["constrained_columns"] == ["id"]
+    unique_names = {tuple(u["column_names"]) for u in inspector.get_unique_constraints("projects")}
+    assert ("name",) in unique_names
+
+
+def test_database_enforces_unique_project_name(client):
+    """The unique constraint must hold at the database level, not just in the API."""
+    from sqlalchemy.exc import IntegrityError
+
+    _, _, _ = client
+    session = get_session_factory()()
+    try:
+        session.add(Project(name="unique-name"))
+        session.commit()
+    finally:
+        session.close()
+
+    session = get_session_factory()()
+    try:
+        session.add(Project(name="unique-name"))
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+    finally:
+        session.close()
