@@ -1,5 +1,7 @@
 """Tests for application startup, /health, database init, and configuration loading."""
 
+from sqlalchemy import text
+
 from app.config import get_settings
 from app.db import check_database
 from app.main import app
@@ -87,6 +89,90 @@ def test_config_defaults(monkeypatch):
         _clear_caches()
 
 
+def test_config_host_and_port_defaults(monkeypatch):
+    monkeypatch.delenv("HOST", raising=False)
+    monkeypatch.delenv("PORT", raising=False)
+    _clear_caches()
+    try:
+        s = get_settings()
+        assert s.host == "0.0.0.0"
+        assert s.port == 8000
+    finally:
+        _clear_caches()
+
+
+def test_config_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("APP_NAME", "Case Sensitive Check")
+    _clear_caches()
+    try:
+        assert get_settings().app_name == "Case Sensitive Check"
+    finally:
+        _clear_caches()
+
+
+def test_config_ignores_unknown_environment_variables(monkeypatch):
+    monkeypatch.setenv("SOME_UNKNOWN_SETTING", "should-not-break")
+    monkeypatch.setenv("ANOTHER_RANDOM_VAR", "123")
+    _clear_caches()
+    try:
+        s = get_settings()
+        assert s.app_name == "AI CTO Hub Orchestrator"
+    finally:
+        _clear_caches()
+
+
+def test_config_port_type_is_int(monkeypatch):
+    monkeypatch.setenv("PORT", "9000")
+    _clear_caches()
+    try:
+        assert get_settings().port == 9000
+        assert isinstance(get_settings().port, int)
+    finally:
+        _clear_caches()
+
+
+# ---------- database session lifecycle ----------
+
+
+def test_session_is_closed_after_request(client):
+
+    c, _, _ = client
+    c.get("/projects")
+    # The dependency must yield a fresh, closed session per request.
+    # A second request must not hit a "session is closed" error.
+    r = c.get("/projects")
+    assert r.status_code == 200
+
+
+def test_session_rolls_back_on_error(client, monkeypatch):
+    """A failed commit must leave the database clean for the next request."""
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session
+
+    c, _, _ = client
+
+    def _boom(*args, **kwargs):
+        raise IntegrityError("INSERT ...", {}, Exception("boom"))
+
+    monkeypatch.setattr(Session, "commit", _boom)
+    r = c.post("/projects", json={"name": "rollback-me"})
+    assert r.status_code == 409
+    monkeypatch.undo()
+    # Next request must work with a clean session and no stale row.
+    r = c.get("/projects")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_engine_pool_is_usable_after_shutdown(client):
+    """After TestClient closes (lifespan dispose), the engine must still work."""
+    from app.db import get_engine
+
+    _, _, _ = client
+    with get_engine().connect() as conn:
+        assert conn.execute(text("SELECT 1")).scalar() == 1
+
+
 # ---------- error handling ----------
 
 
@@ -105,3 +191,35 @@ def test_unhandled_error_returns_json_500(client):
         assert r.json() == {"detail": "Internal server error"}
     finally:
         app.router.routes = [r for r in app.router.routes if getattr(r, "path", None) != "/_boom"]
+
+
+def test_validation_error_response_structure(client):
+    """A 422 must use the standard FastAPI error shape with a field location."""
+    c, _, _ = client
+    r = c.post("/projects", json={"name": "../evil"})
+    assert r.status_code == 422
+    body = r.json()
+    assert "detail" in body
+    assert isinstance(body["detail"], list)
+    first = body["detail"][0]
+    assert set(first) >= {"type", "loc", "msg", "input"}
+    assert "name" in first["loc"]
+    assert "path separator" in first["msg"].lower() or "letter or digit" in first["msg"].lower()
+
+
+def test_conflict_response_body(client):
+    """A 409 must carry a JSON detail message, not an empty body."""
+    c, _, _ = client
+    c.post("/projects", json={"name": "conflict-body"})
+    r = c.post("/projects", json={"name": "conflict-body"})
+    assert r.status_code == 409
+    assert r.json() == {"detail": "Project name already exists"}
+
+
+def test_not_found_response_body(client):
+    c, _, _ = client
+    import uuid
+
+    r = c.get(f"/projects/{uuid.uuid4()}")
+    assert r.status_code == 404
+    assert r.json() == {"detail": "Project not found"}

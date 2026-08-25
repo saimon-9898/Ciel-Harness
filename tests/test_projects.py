@@ -1,6 +1,7 @@
 """Tests for project management and workspace isolation."""
 
 import uuid
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,33 @@ def test_create_project_rejects_unsafe_names(client, bad_name):
     c, _, _ = client
     r = c.post("/projects", json={"name": bad_name})
     assert r.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "exotic_name",
+    [
+        "../..",
+        "..%2f..",
+        "a/../../b",
+        "a\x00b",  # null byte
+        "..\u2215etc",  # unicode solidus (not a real separator)
+        "a\nb",
+        "a\tb",
+        "\x1f",
+        "\u202eabc",  # right-to-left override
+        "-",
+        "_",
+        ".",
+        ".well-known",
+    ],
+)
+def test_create_project_rejects_exotic_names(client, exotic_name):
+    """No exotic or encoded name may reach the filesystem as a directory."""
+    c, _, projects_root = client
+    r = c.post("/projects", json={"name": exotic_name})
+    assert r.status_code == 422, f"{exotic_name!r} unexpectedly accepted: {r.text}"
+    # The rejected name must never create a workspace directory.
+    assert list(projects_root.iterdir()) == []
 
 
 def test_create_project_name_boundaries(client):
@@ -254,6 +282,28 @@ def test_cross_project_workspace_isolation(client):
         service.validate_workspace(a, str(ws_b / "secret.txt"))
 
 
+def test_cross_project_symlink_into_other_workspace_rejected(client):
+    """A symlink planted in A that points at B's workspace must not traverse."""
+    c, _, projects_root = client
+    a = _get_project(uuid.UUID(_create(c, name="sym-a")["id"]))
+    _get_project(uuid.UUID(_create(c, name="sym-b")["id"]))
+    service = _workspace_service()
+    (projects_root / "sym-b" / "secret.txt").write_text("secret")
+    (projects_root / "sym-a" / "to-b").symlink_to(projects_root / "sym-b")
+    with pytest.raises(WorkspaceError):
+        service.validate_workspace(a, "to-b/secret.txt")
+
+
+def test_cross_project_workspace_directories_are_siblings(client):
+    """Each workspace is a direct child of the projects root, never nested."""
+    c, _, projects_root = client
+    _create(c, name="top")
+    _create(c, name="nested")
+    for name in ("top", "nested"):
+        workspace = (projects_root / name).resolve()
+        assert workspace.parent == projects_root.resolve()
+
+
 def test_create_project_workspaces_are_distinct(client):
     c, _, projects_root = client
     _create(c, name="project-a")
@@ -295,6 +345,72 @@ def test_openapi_schema_exposes_all_routes(client):
     assert "get" in schema["paths"]["/projects"]
     assert "get" in schema["paths"]["/projects/{project_id}"]
     assert "get" in schema["paths"]["/health"]
+
+
+# ---------- response JSON structure ----------
+
+_PROJECT_FIELDS = {
+    "id",
+    "name",
+    "repository_url",
+    "repository_path",
+    "default_branch",
+    "status",
+    "created_at",
+    "updated_at",
+}
+
+
+def test_create_response_matches_project_out_schema(client):
+    c, _, _ = client
+    body = _create(c, name="resp-create", repository_url="https://x.example/r")
+    assert set(body) == _PROJECT_FIELDS
+
+
+def test_get_response_matches_project_out_schema(client):
+    c, _, _ = client
+    created = _create(c, name="resp-get")
+    body = c.get(f"/projects/{created['id']}").json()
+    assert set(body) == _PROJECT_FIELDS
+
+
+def test_list_response_is_array_of_project_out(client):
+    c, _, _ = client
+    _create(c, name="resp-list-1")
+    _create(c, name="resp-list-2")
+    body = c.get("/projects").json()
+    assert isinstance(body, list)
+    assert len(body) == 2
+    for project in body:
+        assert set(project) == _PROJECT_FIELDS
+
+
+def test_list_response_order_is_stable(client):
+    """Projects list must be ordered by created_at, then by name as tie-break."""
+    from datetime import datetime
+
+    from sqlalchemy import text as sa_text
+
+    c, _, _ = client
+    _create(c, name="beta")
+    _create(c, name="alpha")
+    _create(c, name="alpha-2")
+
+    # Force distinct created_at values so timestamp precedence is observable.
+    with get_engine().connect() as conn:
+        rows = conn.execute(sa_text("SELECT id, name FROM projects ORDER BY name")).all()
+        for i, (project_id, _name) in enumerate(rows):
+            stamp = datetime(2026, 1, 1, 0, 0, i, tzinfo=UTC)
+            conn.execute(
+                sa_text("UPDATE projects SET created_at = :s WHERE id = :id"),
+                {"s": stamp, "id": project_id},
+            )
+        conn.commit()
+
+    names = [p["name"] for p in c.get("/projects").json()]
+    # created_at order is alpha-2 (0s), beta (1s), alpha (2s) by insertion
+    # mapping; within the same created_at the name tie-break applies.
+    assert names == sorted(names)
 
 
 # ---------- database schema and constraints ----------

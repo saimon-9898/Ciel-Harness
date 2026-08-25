@@ -87,7 +87,12 @@ class WorkspaceService:
         workspace = self.get_workspace(project)
         user_path = Path(path)
         candidate = user_path if user_path.is_absolute() else workspace / user_path
-        resolved = candidate.resolve()
+        try:
+            resolved = candidate.resolve()
+        except (OSError, ValueError) as exc:
+            # e.g. embedded null bytes, unreachable symlink targets, or
+            # runaway symlink depth. Never leak a raw filesystem error.
+            raise WorkspaceError(f"could not resolve path {str(path)!r}") from exc
         if not _is_relative_to(resolved, workspace):
             raise WorkspaceError("path escapes the project workspace")
         return resolved
