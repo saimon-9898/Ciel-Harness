@@ -241,3 +241,71 @@ def test_get_workspace_root_does_not_exist_yet_is_resolved(tmp_path):
     project = _project("x")
     workspace = _service(root).get_workspace(project)
     assert workspace == (root / "x").resolve()
+
+
+# ---------- TOCTOU / symlink-swap containment ----------
+
+
+def test_get_workspace_rejects_symlink_planted_at_workspace_path(tmp_path):
+    """A symlink at the workspace path pointing outside the root is rejected.
+
+    This exercises the containment check in ``get_workspace`` (line 54 in
+    workspaces.py): an attacker who can write to the projects root plants
+    ``projects/<name> -> /somewhere-outside`` before the project is created.
+    """
+    root = tmp_path / "projects"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "victim").symlink_to(outside)
+
+    with pytest.raises(WorkspaceError):
+        _service(root).get_workspace(_project("victim"))
+
+
+def test_create_workspace_rejects_symlink_planted_at_workspace_path(tmp_path):
+    """create_workspace also rejects a pre-planted escaping symlink."""
+    root = tmp_path / "projects"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "victim").symlink_to(outside)
+
+    with pytest.raises(WorkspaceError):
+        _service(root).create_workspace(_project("victim"))
+
+
+def test_create_workspace_catches_symlink_swapped_between_resolve_and_mkdir(tmp_path, monkeypatch):
+    """Post-mkdir re-verification catches a symlink swapped in mid-flight.
+
+    Deterministically simulates the TOCTOU race: ``get_workspace`` resolves
+    the path safely (it is a real directory inside the root), then the
+    directory is renamed out of the way and replaced with a symlink pointing
+    outside the root *before* ``mkdir`` runs. The re-resolution after
+    ``mkdir`` must detect the escape and raise ``WorkspaceError``.
+    """
+    root = tmp_path / "projects"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    service = _service(root)
+    project = _project("swap")
+
+    # A real directory so get_workspace resolves inside the root.
+    (root / "swap").mkdir()
+
+    original_get_workspace = service.get_workspace
+
+    def racing_get_workspace(proj):
+        result = original_get_workspace(proj)
+        # Simulate the attacker swapping the directory for an escaping symlink
+        # in the window between resolution and use.
+        (root / "swap").rename(root / "swap_saved")
+        (root / "swap").symlink_to(outside)
+        return result
+
+    monkeypatch.setattr(service, "get_workspace", racing_get_workspace)
+
+    with pytest.raises(WorkspaceError):
+        service.create_workspace(project)
+    assert (root / "swap").is_symlink()  # swap still in place, no dir escaped

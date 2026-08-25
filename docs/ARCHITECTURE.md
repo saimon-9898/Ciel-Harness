@@ -165,9 +165,38 @@ The projects root is server configuration (set via `WORKSPACES_ROOT` env
 var), never an API parameter. No Phase 2 endpoint exposes raw filesystem
 access to the caller.
 
-**Known limitation:** the checks are synchronous and not race-free against
-concurrent symlink swaps (TOCTOU). This is acceptable for Phase 2's
-single-user, single-orchestrator context.
+**Known limitation (TOCTOU):** the containment checks are synchronous and
+not race-free against concurrent symlink swaps.
+
+- **The exact race:** `get_workspace()` resolves and verifies a path, then
+  a caller uses it later. If a process that can write to the projects root
+  or a workspace swaps a directory for a symlink pointing outside between
+  resolution and use, the verified path can escape containment. The same
+  window exists between `get_workspace()` and `mkdir()` in
+  `create_workspace()`, which is why that method re-resolves and re-verifies
+  the workspace *after* creation (defense in depth).
+- **Why it exists:** closing the window fully requires directory-fd based
+  operations (e.g. `openat2` with `RESOLVE_BENEATH`/`RESOLVE_NO_SYMLINKS`)
+  or an OS-level sandbox, neither of which is portable or warranted at this
+  stage.
+- **Realistic impact:** LOW. Exploitation requires local write access to the
+  projects root or a workspace directory, which already grants the ability
+  to read and write those files directly. No Phase 2 endpoint exposes
+  caller-controlled filesystem paths, so there is no untrusted-input vector
+  through the API. The single-user, single-orchestrator operator is the only
+  party able to write those directories.
+- **Mitigation already present:** (1) `Path.resolve()` follows symlinks at
+  check time; (2) `create_workspace()` re-verifies the resolved path after
+  `mkdir`; (3) the projects root is server configuration, never an API
+  parameter; (4) project names are regex-restricted to
+  `[A-Za-z0-9._-]` so they cannot contain separators; (5) `validate_workspace`
+  resolves and verifies every caller-supplied path and wraps raw filesystem
+  errors. Lines 54 and 63 of `workspaces.py` (the two containment raises) are
+  covered by tests, including a deterministic symlink-swap race simulation.
+- **Why deferred:** eliminating the race requires an fd-based API redesign
+  with `openat2`-style semantics. That is a Phase 3+ concern when
+  multi-user access and agent-driven file writes make the attack surface
+  real; revisit before adding any endpoint that writes caller-supplied paths.
 
 ### 8. API layer (`orchestrator/app/main.py`)
 
@@ -247,4 +276,6 @@ dependency is installed in Phase 2.
   `Base.metadata.create_all()`. Alembic should be introduced when models are
   added.
 - Workspace path checks have a TOCTOU gap (symlink swaps between resolution
-  and use). Acceptable for single-user operation; revisit for multi-user.
+  and use). Documented in detail in section 7; acceptable for single-user
+  operation and mitigated by post-mkdir re-verification. Revisit before
+  adding any endpoint that writes caller-supplied paths.
