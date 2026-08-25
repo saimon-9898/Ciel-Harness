@@ -347,6 +347,38 @@ def test_openapi_schema_exposes_all_routes(client):
     assert "get" in schema["paths"]["/health"]
 
 
+def test_openapi_declares_error_responses(client):
+    """Every response code the API can return must be declared in OpenAPI."""
+    c, _, _ = client
+    schema = c.get("/openapi.json").json()
+    paths = schema["paths"]
+
+    post_responses = set(paths["/projects"]["post"]["responses"])
+    assert {"201", "400", "409", "422"} <= post_responses
+
+    get_item_responses = set(paths["/projects/{project_id}"]["get"]["responses"])
+    assert {"200", "404", "422"} <= get_item_responses
+
+    get_list_responses = set(paths["/projects"]["get"]["responses"])
+    assert "200" in get_list_responses
+
+
+def test_openapi_project_create_schema_constraints(client):
+    """The request schema must document name length and the optional URLs."""
+    c, _, _ = client
+    schema = c.get("/openapi.json").json()
+    props = schema["components"]["schemas"]["ProjectCreate"]["properties"]
+    assert props["name"]["minLength"] == 1
+    assert props["name"]["maxLength"] == 255
+    # Optional strings carry their maxLength inside the string alternative.
+    url_alt = next(a for a in props["repository_url"]["anyOf"] if a["type"] == "string")
+    assert url_alt["maxLength"] == 2048
+    path_alt = next(a for a in props["repository_path"]["anyOf"] if a["type"] == "string")
+    assert path_alt["maxLength"] == 1024
+    assert props["default_branch"]["maxLength"] == 255
+    assert props["default_branch"]["default"] == "main"
+
+
 # ---------- response JSON structure ----------
 
 _PROJECT_FIELDS = {

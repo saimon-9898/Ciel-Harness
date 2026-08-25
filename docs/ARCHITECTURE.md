@@ -124,7 +124,7 @@ projects/
 └── project-b/
 ```
 
-The `WorkspaceService` provides three operations:
+The `WorkspaceService` provides the following operations:
 
 #### `get_workspace(project) -> Path`
 
@@ -149,6 +149,17 @@ chokepoint for all filesystem access; it prevents:
 | Absolute-path injection       | Absolute paths are allowed only if they resolve inside workspace|
 | Symlink escape                | `resolve()` follows symlinks; containment check catches escapes |
 | Cross-project access          | Verification is *per workspace*; project A cannot reach B's dir |
+
+#### `ensure_root() -> Path`
+
+Creates the configured projects root directory (idempotent) if it does not
+exist. Called during application startup.
+
+#### `remove_workspace(project) -> None`
+
+Best-effort removal of a project's workspace directory. Only empty
+directories are removed; non-empty directories are logged and left intact.
+Used to clean up a workspace when project creation fails.
 
 The projects root is server configuration (set via `WORKSPACES_ROOT` env
 var), never an API parameter. No Phase 2 endpoint exposes raw filesystem
@@ -185,8 +196,8 @@ Shutdown:
   `/app/logs`, and `/app/projects` are created in the image.
 - **`docker-compose.yml`** exposes port 8000, mounts `./data:/app/data` and
   `./projects:/app/projects` for persistence, and includes a healthcheck that
-  curls `/health`. Environment variables are configurable via `.env` and
-  docker-compose `${VAR:-default}` substitution.
+  fetches `/health` with Python's `urllib`. Environment variables are
+  configurable via `.env` and docker-compose `${VAR:-default}` substitution.
 
 ### 11. Security
 

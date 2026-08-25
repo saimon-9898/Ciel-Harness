@@ -34,7 +34,23 @@ def _get_project_or_404(session: Session, project_id: uuid.UUID) -> Project:
     return project
 
 
-@router.post("", response_model=ProjectOut, status_code=status.HTTP_201_CREATED)
+_ERROR_RESPONSES = {
+    400: {"description": "Bad request (e.g. workspace path rejected)"},
+    409: {"description": "Project name already exists"},
+    404: {"description": "Project not found"},
+}
+
+
+@router.post(
+    "",
+    response_model=ProjectOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        "400": _ERROR_RESPONSES[400],
+        "409": _ERROR_RESPONSES[409],
+        "422": {"description": "Validation error"},
+    },
+)
 def create_project(
     payload: ProjectCreate,
     session: Session = Depends(get_session),
@@ -88,7 +104,14 @@ def list_projects(session: Session = Depends(get_session)) -> list[Project]:
     return list(session.scalars(select(Project).order_by(Project.created_at, Project.name)))
 
 
-@router.get("/{project_id}", response_model=ProjectOut)
+@router.get(
+    "/{project_id}",
+    response_model=ProjectOut,
+    responses={
+        "404": _ERROR_RESPONSES[404],
+        "422": {"description": "Validation error"},
+    },
+)
 def get_project(project_id: uuid.UUID, session: Session = Depends(get_session)) -> Project:
     """Fetch a single project by id."""
     return _get_project_or_404(session, project_id)
