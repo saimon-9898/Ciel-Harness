@@ -221,3 +221,35 @@ def test_create_project_workspaces_are_distinct(client):
     assert ws_a.is_dir()
     assert ws_b.is_dir()
     assert ws_a != ws_b
+
+
+# ---------- creation failure handling ----------
+
+
+def test_create_project_commit_race_returns_409_and_cleans_workspace(client, monkeypatch):
+    """A unique-name race at commit time must not 500 or orphan a workspace."""
+    c, _, projects_root = client
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session
+
+    def _boom(*args, **kwargs):
+        raise IntegrityError("INSERT INTO projects ...", {}, Exception("UNIQUE constraint failed"))
+
+    monkeypatch.setattr(Session, "commit", _boom)
+    r = c.post("/projects", json={"name": "race"})
+    assert r.status_code == 409
+    assert r.json() == {"detail": "Project name already exists"}
+    assert not (projects_root / "race").exists()
+
+
+# ---------- OpenAPI contract ----------
+
+
+def test_openapi_schema_exposes_all_routes(client):
+    c, _, _ = client
+    schema = c.get("/openapi.json").json()
+    assert set(schema["paths"]) == {"/health", "/projects", "/projects/{project_id}"}
+    assert "post" in schema["paths"]["/projects"]
+    assert "get" in schema["paths"]["/projects"]
+    assert "get" in schema["paths"]["/projects/{project_id}"]
+    assert "get" in schema["paths"]["/health"]

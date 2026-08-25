@@ -63,6 +63,19 @@ class WorkspaceService:
             raise WorkspaceError(f"workspace for {project.name!r} escapes the projects root")
         return resolved
 
+    def remove_workspace(self, project: Project) -> None:
+        """Best-effort removal of a project's (empty) workspace directory.
+
+        Used to clean up a workspace when project creation fails after the
+        directory was created. Only empty directories are removed; non-empty
+        directories are left untouched and logged.
+        """
+        workspace = self.get_workspace(project)
+        try:
+            workspace.rmdir()
+        except OSError:
+            logger.warning("could not remove workspace %s", workspace, exc_info=True)
+
     def validate_workspace(self, project: Project, path: str | Path) -> Path:
         """Resolve a user-supplied path inside a project's workspace.
 

@@ -9,6 +9,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import get_settings
@@ -55,12 +56,24 @@ def create_project(
     )
     try:
         workspaces.create_workspace(project)
+        session.add(project)
+        session.commit()
     except WorkspaceError as exc:
         logger.error("failed to create workspace for project %r: %s", payload.name, exc)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-
-    session.add(project)
-    session.commit()
+    except IntegrityError as exc:
+        # Race: another request inserted the same unique name between the
+        # pre-check and this commit. Roll back and report a clean conflict.
+        session.rollback()
+        workspaces.remove_workspace(project)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Project name already exists",
+        ) from exc
+    except Exception:
+        session.rollback()
+        workspaces.remove_workspace(project)
+        raise
     session.refresh(project)
     logger.info(
         "project created",
