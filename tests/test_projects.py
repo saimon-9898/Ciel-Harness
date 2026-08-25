@@ -75,6 +75,23 @@ def test_create_project_rejects_unsafe_names(client, bad_name):
     assert r.status_code == 422
 
 
+def test_create_project_name_boundaries(client):
+    c, _, projects_root = client
+    for name in ("a", "my.project_v2", "MyProject", "2nd-try", "a" * 255):
+        body = _create(c, name=name)
+        assert body["name"] == name
+        assert (projects_root / name).is_dir()
+    # one character over the limit is rejected
+    r = c.post("/projects", json={"name": "a" * 256})
+    assert r.status_code == 422
+
+
+def test_create_project_ignores_unknown_fields(client):
+    c, _, _ = client
+    body = _create(c, name="clean-fields", extra_stuff="ignored", nope=123)
+    assert body["name"] == "clean-fields"
+
+
 # ---------- project retrieval ----------
 
 
@@ -134,6 +151,31 @@ def test_get_workspace_rejects_unsafe_name(client):
     project.name = "../evil"  # defense-in-depth: name mutated after creation
     with pytest.raises(WorkspaceError):
         _workspace_service().get_workspace(project)
+
+
+def test_workspace_empty_path_resolves_to_workspace(client):
+    c, _, projects_root = client
+    project = _get_project(uuid.UUID(_create(c, name="empty")["id"]))
+    resolved = _workspace_service().validate_workspace(project, "")
+    assert resolved == (projects_root / "empty").resolve()
+
+
+def test_workspace_dot_segments_staying_inside_are_allowed(client):
+    c, _, projects_root = client
+    project = _get_project(uuid.UUID(_create(c, name="dots")["id"]))
+    (projects_root / "dots" / "sub").mkdir()
+    resolved = _workspace_service().validate_workspace(project, "sub/./../sub")
+    assert resolved == (projects_root / "dots" / "sub").resolve()
+
+
+def test_remove_workspace_is_idempotent(client):
+    c, _, projects_root = client
+    body = _create(c, name="cleanup")
+    project = _get_project(uuid.UUID(body["id"]))
+    service = _workspace_service()
+    service.remove_workspace(project)
+    assert not (projects_root / "cleanup").exists()
+    service.remove_workspace(project)  # second call must not raise
 
 
 # ---------- path traversal and absolute-path rejection ----------
