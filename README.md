@@ -1,8 +1,7 @@
-# AI CTO Hub — Phase 4: Agent Abstraction
+# AI CTO Hub — Phase 5: Real OpenHands Execution
 
 A self-hosted AI coding-agent orchestration platform. This repository contains
-the backend foundation that will later orchestrate OpenHands, Claude Code,
-Codex, and Gemini coding agents.
+the backend foundation that orchestrates OpenHands coding agents.
 
 **Phase 1 delivered:** a minimal FastAPI backend with structured logging,
 database initialization, configuration, error handling, a liveness endpoint,
@@ -15,14 +14,17 @@ directory on disk.
 **Phase 3 delivered:** the Task engine — tasks are created under a project,
 transitioned through a deterministic state machine, queried, and cancelled.
 
-**Phase 4 delivers:** the provider-independent Agent abstraction — a closed
+**Phase 4 delivered:** the provider-independent Agent abstraction — a closed
 provider enum, strict Pydantic contracts, an Agent model, an agent
-registry/manager, honest non-fake adapters (they report `not_configured`), a
-minimal agent-management API, and non-executing task→agent assignment.
+registry/manager, honest non-fake adapters, a minimal agent-management API,
+and non-executing task→agent assignment.
 
-There is **no agent execution yet**: adapters exist as honest boundaries and
-report `not_configured`; nothing connects to a real provider; no task ever
-runs on an agent. No autonomous mode and no dashboard are implemented yet.
+**Phase 5 delivers:** real OpenHands Cloud API integration — an execution
+endpoint that starts asynchronous agent conversations, polls the provider for
+completion, and transitions the task through the state machine. The target
+repository is derived server-side from the project's git workspace (never
+from an HTTP parameter). Cancellation is truthfully reported as unsupported
+(the OpenHands Cloud API has no documented cancellation endpoint).
 
 ---
 
@@ -244,6 +246,108 @@ receives `409`.
 
 ---
 
+## Execution API (Phase 5)
+
+| Endpoint                             | Method | Description                                        |
+|--------------------------------------|--------|----------------------------------------------------|
+| `/tasks/{task_id}/execute`           | POST   | Start a real OpenHands execution (202 Accepted)    |
+| `/tasks/{task_id}/execution`         | GET    | Read the stored execution state (no provider poll) |
+| `/tasks/{task_id}/execution/refresh` | POST   | Poll the provider and advance the task             |
+
+### Prerequisites for execution
+
+1. The task's project must have a workspace that is a **git clone with an
+   `origin` remote**. The `owner/repo` string sent to OpenHands is derived
+   **server-side from that remote** — never from an HTTP parameter.
+2. The task must be assigned an **`AVAILABLE` `openhands` agent** and be in
+   state `QUEUED`.
+3. The orchestrator must be configured with OpenHands credentials
+   (`OPENHANDS_API_KEY`, `OPENHANDS_BASE_URL`), see below.
+
+### Start an execution
+
+```bash
+curl -X POST http://localhost:8000/tasks/<task-id>/execute
+```
+
+```json
+{
+  "task_id": "3f2c...uuid...",
+  "status": "WAITING_FOR_AGENT",
+  "execution_status": "running",
+  "reference": "<openhands app_conversation_id>"
+}
+```
+
+`202 Accepted` means the provider accepted the task. The agent conversation
+runs asynchronously; poll `refresh` to advance the task.
+
+### Read execution state (no provider poll)
+
+```bash
+curl http://localhost:8000/tasks/<task-id>/execution
+```
+
+### Poll the provider
+
+```bash
+curl -X POST http://localhost:8000/tasks/<task-id>/execution/refresh
+```
+
+When the provider reports `finished`, the task transitions to
+`WAITING_FOR_REVIEW` and the agent is released back to `AVAILABLE`. When the
+provider reports `error`/`stuck`, or the orchestrator-side patience limit is
+exceeded, the task transitions to `FAILED` (the provider conversation may
+still be running in the OpenHands UI; this is reported truthfully).
+
+### Execution lifecycle
+
+```
+QUEUED -> RUNNING -> WAITING_FOR_AGENT -> WAITING_FOR_REVIEW   (agent finished)
+QUEUED -> RUNNING -> FAILED                                    (start/provider failure)
+WAITING_FOR_AGENT -> FAILED                                    (provider error / timeout)
+```
+
+The task transition `QUEUED -> RUNNING` is a DB-safe compare-and-swap, so two
+concurrent `execute` calls cannot start the same task twice: exactly one wins,
+the other receives `409`. The agent claim `AVAILABLE -> BUSY` is also CAS, so
+one agent never runs two executions at once; the agent is always released back
+to `AVAILABLE` on completion, failure, or timeout.
+
+### Execution errors
+
+| Condition                                                    | HTTP status |
+|--------------------------------------------------------------|-------------|
+| Task does not exist                                          | `404`       |
+| Agent does not exist                                         | `404`       |
+| Task not `QUEUED`, agent not usable, workspace not a git clone | `409`     |
+| Provider not configured (`OPENHANDS_API_KEY` missing)        | `409`       |
+| In-flight execution cannot be cancelled (unsupported)        | `409`       |
+| Provider rejected the request                                | `502`       |
+| Provider timeout / start timeout                             | `504`       |
+
+Cancelling a task with an in-flight execution is rejected with `409`: the
+OpenHands Cloud API documents no cancellation endpoint, so the orchestrator
+truthfully refuses rather than faking a cancellation.
+
+### OpenHands configuration
+
+| Variable                        | Default                          | Meaning                              |
+|---------------------------------|----------------------------------|--------------------------------------|
+| `OPENHANDS_BASE_URL`            | `https://app.all-hands.dev`      | OpenHands Cloud API base URL         |
+| `OPENHANDS_API_KEY`             | *(empty)*                        | Cloud API token (kept out of logs)   |
+| `OPENHANDS_TIMEOUT`             | `30`                             | Per-request timeout (seconds)        |
+| `OPENHANDS_START_TIMEOUT`       | `120`                            | Start-task poll budget (seconds)     |
+| `OPENHANDS_POLL_INTERVAL`       | `5`                              | Poll interval for refresh (seconds)  |
+| `OPENHANDS_MAX_EXECUTION_SECONDS` | `3600`                         | Orchestrator patience limit (seconds)|
+
+The API key is read from the environment (or `.env`) only. It is never
+returned by any endpoint, logged, or stored in the database. Agent
+`configuration` still rejects secret-looking keys (`api_key`, `token`, ...)
+with `422`.
+
+---
+
 ## Agents API
 
 | Endpoint                   | Method | Description                                    |
@@ -253,8 +357,9 @@ receives `409`.
 | `/agents/{agent_id}`       | GET    | Fetch a single agent by UUID                    |
 | `/agents/{agent_id}/health`| GET    | Probe the agent's provider adapter              |
 
-**There is no execute endpoint.** Phase 4 registers agent *definitions* only;
-nothing runs a task on an agent.
+**The agents router has no execute endpoint.** Phase 4 registers agent
+*definitions*; real execution happens on tasks via `POST /tasks/{id}/execute`
+(see the Execution API section) using an agent's assigned provider adapter.
 
 ### Register an agent
 
@@ -292,10 +397,15 @@ Key behaviors:
   `token`, `secret`, `password`, `auth`, ...) are rejected with `422`, and
   responses redact them defensively.
 - **Global scope.** Agents are infrastructure shared across projects. Phase 5
-  execution must enforce per-assignment workspace isolation.
+  execution enforces per-task workspace isolation: the target repository is
+  derived from the task's own project workspace git `origin`, so an agent
+  never receives a repository chosen by a client.
 - **Health probes are truthful.** `/agents/{id}/health` reports
-  `not_configured` for every provider; a `200` means the probe itself ran,
-  not that the provider is reachable.
+  `not_configured` when the provider has no API key, `unavailable` when
+  authentication is rejected, `error` when the API is unreachable, and
+  `available` only when a real authenticated probe answers `200`. The other
+  providers (`claude_code`, `codex`, `gemini`) have no real adapter yet and
+  always report `not_configured`.
 
 ### Assigning an agent to a task
 
@@ -335,6 +445,24 @@ resolve filesystem paths for a project. It enforces:
 
 The projects root is server configuration (`WORKSPACES_ROOT`), never an API
 parameter. No API endpoint in Phase 2 exposes raw filesystem access.
+
+### Git repository binding (Phase 5)
+
+OpenHands execution needs an `owner/repo` target. The orchestrator derives it
+**server-side** with `WorkspaceService.resolve_repository(project)`:
+
+- Runs `git -C <workspace> remote get-url origin` (argument list, no shell),
+  so a malicious remote URL can never be interpreted as a command.
+- Parses https, ssh (scp-like and `ssh://`), and bare `owner/repo` forms into
+  a strict `owner/repo` pattern. Traversal (`..`), extra path segments,
+  option-shaped values, and embedded shell metacharacters are rejected.
+- Uses the project's `default_branch` (server field, validated) as the branch.
+- A workspace that is not a git clone with an `origin` remote makes
+  `execute` fail with `409`.
+
+No client-supplied string ever becomes the repository: the workspace is the
+single source of truth, so a forged HTTP parameter cannot redirect an agent
+to an attacker-chosen repository.
 
 ---
 
@@ -388,9 +516,14 @@ ai-cto/
 │       ├── agent_contracts.py # Strict agent data contracts
 │       ├── agent_errors.py    # Agent exception hierarchy
 │       ├── agent_manager.py   # Agent registry + adapter resolution
-│       └── adapters/          # AgentAdapter boundary + 4 honest adapters
+│       ├── execution_service.py # ExecutionService (start/poll/finish)
+│       └── adapters/          # AgentAdapter boundary
+│           ├── base.py        # AgentAdapter protocol
+│           └── openhands.py   # Real OpenHands Cloud API V1 adapter
 ├── tests/
 │   ├── conftest.py            # Shared test fixtures
+│   ├── fake_openhands.py      # Fake OpenHands Cloud API server (tests only)
+│   ├── fake_adapters.py       # Fake in-memory adapter (tests only)
 │   ├── test_health.py         # Phase 1 test suite
 │   ├── test_projects.py       # Project + workspace isolation tests
 │   ├── test_task_states.py    # State machine tests
@@ -399,7 +532,10 @@ ai-cto/
 │   ├── test_agent_providers.py# Provider enum + config validation tests
 │   ├── test_agent_contracts.py# Agent data contract tests
 │   ├── test_agent_manager.py  # Registry/adapter/health tests
-│   └── test_agents_api.py     # Agents API + OpenAPI contract tests
+│   ├── test_agents_api.py     # Agents API + OpenAPI contract tests
+│   ├── test_openhands_adapter.py # OpenHands wire-protocol tests
+│   ├── test_workspace_repository.py # Git-origin repository resolution tests
+│   └── test_execution.py      # Execution lifecycle + API tests
 ├── data/                      # SQLite database (gitignored, bind-mounted)
 ├── projects/                  # Per-project workspaces (gitignored, bind-mounted)
 └── logs/                      # Reserved for future use
@@ -425,15 +561,26 @@ ai-cto/
 
 ---
 
-## Known limitations (Phase 4)
+## Known limitations (Phase 5)
 
 - Docker is not installed on the current development machine — the Dockerfile
   and docker-compose.yml are syntactically validated but not run. The
   Dockerfile layout (working directory `/app`, `app/` package, `data/` and
   `projects/` bind mounts) was validated by running the app from an identical
   local layout with `uvicorn`.
-- **No agent execution**: adapters exist but every provider reports
-  `not_configured`; no provider connection, no execution, no autonomous mode.
+- **Real OpenHands end-to-end execution is blocked in this environment**: no
+  `OPENHANDS_API_KEY` is available and no OpenHands runtime (Docker or CLI) is
+  installed. The full request→provider→result path is exercised offline
+  against a fake OpenHands Cloud API server implementing the real V1 wire
+  protocol (`tests/fake_openhands.py`) and an in-memory fake adapter
+  (`tests/fake_adapters.py`). Nothing is faked in production code: without an
+  API key the adapter truthfully reports `not configured` and `execute`
+  returns `409`.
+- **Cancellation of in-flight executions is unsupported**: the OpenHands Cloud
+  API V1 documents no cancellation endpoint, so `cancel` on an executing task
+  returns `409` and the adapter raises `AgentCancellationError`.
+- **Only OpenHands has a real adapter.** `claude_code`, `codex`, and `gemini`
+  remain honest boundaries reporting `not_configured`.
 - **No task-update endpoint**: the state machine is advanced only by internal
   service calls, and only creation + cancellation are exposed over HTTP.
 - `WAITING_FOR_APPROVAL` is reachable only from `WAITING_FOR_REVIEW` (a single
@@ -444,9 +591,12 @@ ai-cto/
 - SQLite is the only database driver provided; PostgreSQL requires a driver
   (`psycopg`) in a later phase. The Task engine uses plain SQLAlchemy Core
   UPDATE statements, so the compare-and-swap works unchanged on PostgreSQL.
-- OpenHands, Claude Code, Codex, and Gemini are **not integrated**; the
-  adapters are honest boundaries that report `not_configured`.
-- Agents are global infrastructure; Phase 5 execution must enforce per-task
-  workspace isolation when running an agent.
+- Agents are global infrastructure; execution derives the target repository
+  from the task's project workspace git `origin` (server-side), which enforces
+  per-task workspace isolation.
 - Workspace path checks are synchronous and not race-free against concurrent
   symlink swaps (TOCTOU); revisit before untrusted multi-user use.
+- The `refresh` endpoint polls the provider on demand; there is no background
+  worker or event loop yet (future phase). Until then, a task stays
+  `WAITING_FOR_AGENT` until a client calls refresh or the orchestrator-side
+  patience limit is exceeded on the next refresh.

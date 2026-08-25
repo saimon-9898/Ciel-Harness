@@ -124,6 +124,39 @@ class TaskOut(BaseModel):
     updated_at: datetime
 
 
+class TaskExecuteOut(BaseModel):
+    """Response of ``POST /tasks/{id}/execute`` (202 Accepted).
+
+    ``status`` is the task state after the provider accepted the work
+    (WAITING_FOR_AGENT).  ``execution_status`` is the last-known provider
+    execution state and ``reference`` is the opaque execution handle -- an
+    opaque string the adapter uses to track the provider conversation, not a
+    provider-internal type.
+    """
+
+    task_id: uuid.UUID
+    status: str
+    execution_status: str | None = None
+    reference: str | None = None
+
+
+class TaskExecutionOut(BaseModel):
+    """Provider-independent execution summary returned by the execution
+    status/refresh endpoints.
+
+    ``execution_status`` is the last-known provider execution state
+    (queued/running/completed/failed/cancelled/unknown) and ``detail`` is the
+    adapter's human-readable status text.  ``reference`` is the opaque
+    execution handle.
+    """
+
+    task_id: uuid.UUID
+    task_status: str
+    execution_status: str | None = None
+    detail: str = ""
+    reference: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Agent schemas (Phase 4)
 # ---------------------------------------------------------------------------

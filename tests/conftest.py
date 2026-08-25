@@ -1,5 +1,8 @@
 """Shared pytest fixtures for the orchestrator."""
 
+import shutil
+import subprocess
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -32,3 +35,38 @@ def client(tmp_path, monkeypatch):
     finally:
         dispose_engine()
         _clear_caches()
+
+
+@pytest.fixture(scope="session")
+def git_template(tmp_path_factory):
+    """A real git repository with an origin remote, created once per session.
+
+    ``git init`` is slow, so execution tests copy this template instead of
+    running git for every test.
+    """
+    root = tmp_path_factory.mktemp("git-template")
+    workspace = root / "template"
+    workspace.mkdir()
+    for args in (
+        ["git", "-C", str(workspace), "init", "-b", "main"],
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/demo.git",
+        ],
+    ):
+        proc = subprocess.run(args, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, proc.stderr
+    return workspace
+
+
+@pytest.fixture()
+def git_workspace(tmp_path, git_template):
+    """A fresh per-test copy of the session git template."""
+    dest = tmp_path / "git-proj"
+    shutil.copytree(git_template, dest)
+    return dest

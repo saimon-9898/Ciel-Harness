@@ -18,16 +18,27 @@ from sqlalchemy.orm import Session
 
 from .agent_contracts import AgentHealth
 from .agent_errors import (
+    AgentCancellationError,
     AgentError,
+    AgentMalformedResponseError,
     AgentNameConflictError,
     AgentNotFoundError,
+    AgentProviderError,
+    AgentTimeoutError,
     AgentUnavailableError,
     InvalidAgentConfigurationError,
+    ProviderNotConfiguredError,
     UnsupportedProviderError,
 )
 from .agent_manager import AgentManager
 from .config import get_settings
 from .db import get_session
+from .execution_service import (
+    ExecutionConflictError,
+    ExecutionError,
+    ExecutionNotRunningError,
+    ExecutionService,
+)
 from .models import Agent, Project, Task
 from .schemas import (
     AgentCreate,
@@ -36,6 +47,8 @@ from .schemas import (
     ProjectCreate,
     ProjectOut,
     TaskCreate,
+    TaskExecuteOut,
+    TaskExecutionOut,
     TaskOut,
 )
 from .task_service import (
@@ -47,7 +60,7 @@ from .task_service import (
     TaskService,
     TaskStateConflictError,
 )
-from .task_states import TaskStateError
+from .task_states import WAITING_FOR_AGENT, TaskStateError
 from .workspaces import WorkspaceError, WorkspaceService
 
 logger = logging.getLogger(__name__)
@@ -196,6 +209,10 @@ def _task_service() -> TaskService:
     return TaskService()
 
 
+def _execution_service() -> ExecutionService:
+    return ExecutionService(workspaces=WorkspaceService(get_settings().workspaces_root))
+
+
 def _task_http_error(exc: Exception) -> HTTPException:
     """Map Task engine errors to their HTTP status."""
     if isinstance(exc, ProjectNotFoundError):
@@ -208,7 +225,21 @@ def _task_http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
     if isinstance(exc, AgentUnavailableError):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, ExecutionConflictError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, ExecutionNotRunningError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     if isinstance(exc, (InvalidParentTaskError, TaskStateConflictError, TaskStateError)):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, (ProviderNotConfiguredError, UnsupportedProviderError)):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, AgentCancellationError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, AgentTimeoutError):
+        return HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=str(exc))
+    if isinstance(exc, (AgentProviderError, AgentMalformedResponseError)):
+        return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+    if isinstance(exc, WorkspaceError):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 
@@ -276,10 +307,133 @@ def cancel_task(
     Cancellation is idempotent for already-cancelled tasks (200, state
     unchanged). COMPLETED and FAILED tasks are terminal: cancellation is
     rejected with 409 and never silently rewrites terminal state.
+
+    **In-flight executions** (tasks in WAITING_FOR_AGENT with a stored
+    execution reference) cannot be cancelled because the OpenHands Cloud API
+    does not document a cancellation endpoint.  The task stays in its current
+    state and the execution must finish or time out.
     """
+    task = session.get(Task, task_id)
+    if task is not None and task.status == WAITING_FOR_AGENT and task.execution_reference:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="cancelling an in-flight execution is not supported by the "
+            "openhands provider (Phase 5); the execution must finish or time out",
+        )
     try:
         return tasks.cancel_task(session, task_id)
     except (TaskError, TaskStateError) as exc:
+        raise _task_http_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Execution endpoints (Phase 5)
+# ---------------------------------------------------------------------------
+
+_EXECUTION_ERROR_RESPONSES = {
+    404: {"description": "Task or agent not found"},
+    409: {
+        "description": (
+            "Execution not possible (no agent assigned, unusable agent, "
+            "provider not configured, workspace not a git clone, "
+            "duplicate/concurrent execution, or state conflict) or "
+            "no in-flight execution to refresh"
+        )
+    },
+    422: {"description": "Validation error"},
+    502: {"description": "Provider error (OpenHands failure or malformed response)"},
+    504: {"description": "Provider timeout"},
+}
+
+
+@tasks_router.post(
+    "/{task_id}/execute",
+    response_model=TaskExecuteOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses=_EXECUTION_ERROR_RESPONSES,
+)
+def execute_task(
+    task_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    executions: ExecutionService = Depends(_execution_service),
+) -> TaskExecuteOut:
+    """Start a real execution for a QUEUED task with an assigned agent.
+
+    The task must be in state QUEUED and have an ``agent_id`` referencing an
+    AVAILABLE openhands agent.  The workspace must be a git clone with an
+    ``origin`` remote.
+
+    Returns 202 Accepted with the task reaching WAITING_FOR_AGENT and an
+    opaque execution reference.  Poll ``GET /tasks/{id}/execution`` or
+    ``POST /tasks/{id}/execution/refresh`` to monitor the provider.
+    """
+    try:
+        task = executions.execute_task(session, task_id)
+        return TaskExecuteOut(
+            task_id=task.id,
+            status=task.status,
+            execution_status=task.execution_status,
+            reference=task.execution_reference,
+        )
+    except (TaskError, TaskStateError, AgentError, ExecutionError, WorkspaceError) as exc:
+        raise _task_http_error(exc) from exc
+
+
+@tasks_router.get(
+    "/{task_id}/execution",
+    response_model=TaskExecutionOut,
+    responses=_EXECUTION_ERROR_RESPONSES,
+)
+def get_execution(
+    task_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    executions: ExecutionService = Depends(_execution_service),
+) -> TaskExecutionOut:
+    """Return the current execution state of a task (read-only, no provider poll).
+
+    The ``execution_status`` and ``reference`` fields are the last-known
+    values stored in the database.  Use ``POST /tasks/{id}/execution/refresh``
+    to poll the provider and advance the task.
+    """
+    try:
+        task, _ = executions.get_execution(session, task_id)
+        return TaskExecutionOut(
+            task_id=task.id,
+            task_status=task.status,
+            execution_status=task.execution_status,
+            reference=task.execution_reference,
+        )
+    except (TaskError, AgentError, ExecutionError) as exc:
+        raise _task_http_error(exc) from exc
+
+
+@tasks_router.post(
+    "/{task_id}/execution/refresh",
+    response_model=TaskExecutionOut,
+    responses=_EXECUTION_ERROR_RESPONSES,
+)
+def refresh_execution(
+    task_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    executions: ExecutionService = Depends(_execution_service),
+) -> TaskExecutionOut:
+    """Poll the provider and advance the task according to the result.
+
+    When the provider reports a terminal state the task is transitioned:
+    WAITING_FOR_AGENT -> WAITING_FOR_REVIEW (agent finished) or
+    WAITING_FOR_AGENT -> FAILED (provider error / timeout).
+    The agent is also released back to AVAILABLE.
+    """
+    try:
+        task, status = executions.refresh_execution(session, task_id)
+        return TaskExecutionOut(
+            task_id=task.id,
+            task_status=task.status,
+            execution_status=task.execution_status,
+            detail=status.detail if status is not None else "",
+            reference=task.execution_reference,
+        )
+    except (TaskError, TaskStateError, AgentError, ExecutionError, WorkspaceError) as exc:
         raise _task_http_error(exc) from exc
 
 

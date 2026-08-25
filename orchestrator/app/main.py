@@ -6,8 +6,11 @@ Phase 2 adds project management and workspace isolation.
 Phase 3 adds the Task engine: tasks are created, transitioned through a
 deterministic state machine, queried, and cancelled.
 Phase 4 adds the Agent abstraction: provider-independent adapters, an agent
-registry, health probes, and task->agent assignment. No agent execution or
-automation exists yet — adapters report not-configured.
+registry, health probes, and task->agent assignment.
+Phase 5 adds the real OpenHands execution adapter: it connects to the
+OpenHands Cloud API, executes tasks in the project's validated git workspace,
+tracks asynchronous executions, and translates provider results into task
+state transitions. No autonomous loop or supervisor exists yet.
 """
 
 import logging
@@ -56,7 +59,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="Backend foundation for orchestrating coding agents (Phase 4).",
+    description="Backend foundation for orchestrating coding agents (Phase 5).",
     lifespan=lifespan,
 )
 

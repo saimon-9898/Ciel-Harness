@@ -20,6 +20,7 @@ from app.adapters import (
 )
 from app.agent_contracts import AgentHealthState, AgentTaskRequest
 from app.agent_errors import (
+    AgentCancellationError,
     AgentNameConflictError,
     AgentNotFoundError,
     InvalidAgentConfigurationError,
@@ -264,5 +265,12 @@ def test_adapter_execution_methods_raise_not_configured(adapter_cls):
         adapter.get_status(_handle())
     with pytest.raises(ProviderNotConfiguredError, match="not configured"):
         adapter.get_result(_handle())
-    with pytest.raises(ProviderNotConfiguredError, match="not configured"):
-        adapter.cancel_task(_handle())
+    if adapter_cls is OpenHandsAdapter:
+        # The OpenHands Cloud API has no documented cancellation endpoint, so
+        # cancellation is truthfully unsupported (Phase 5) rather than
+        # "not configured".
+        with pytest.raises(AgentCancellationError, match="unsupported"):
+            adapter.cancel_task(_handle())
+    else:
+        with pytest.raises(ProviderNotConfiguredError, match="not configured"):
+            adapter.cancel_task(_handle())

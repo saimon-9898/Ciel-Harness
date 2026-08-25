@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from .adapters import (
@@ -31,10 +32,14 @@ from .agent_contracts import AgentHealth
 from .agent_errors import (
     AgentNameConflictError,
     AgentNotFoundError,
+    AgentUnavailableError,
     InvalidAgentConfigurationError,
     UnsupportedProviderError,
 )
 from .agent_providers import (
+    AVAILABLE,
+    BUSY,
+    ERROR,
     UNAVAILABLE,
     AgentCapability,
     AgentProvider,
@@ -51,6 +56,10 @@ ADAPTER_REGISTRY: dict[AgentProvider, type[AgentAdapter]] = {
     AgentProvider.CODEX: CodexAdapter,
     AgentProvider.GEMINI: GeminiAdapter,
 }
+
+
+def _now_utc() -> datetime:
+    return datetime.now(UTC)
 
 
 def resolve_adapter(provider: AgentProvider | str) -> AgentAdapter:
@@ -150,3 +159,65 @@ class AgentManager:
         """Run the adapter's health probe for an agent record."""
         agent, adapter = self.get_agent_with_adapter(session, agent_id)
         return adapter.check_health(agent.id)
+
+    # ---- execution lifecycle (Phase 5) ---------------------------------------
+
+    def claim_agent(self, session: Session, agent_id: uuid.UUID) -> Agent:
+        """Claim an AVAILABLE agent for execution with a DB-safe CAS.
+
+        Only AVAILABLE agents may be claimed. The update is conditional
+        (``status = AVAILABLE``), so two concurrent claims cannot both win:
+        the loser observes rowcount 0 and receives
+        :class:`AgentUnavailableError`. The caller must commit.
+        """
+        agent = session.get(Agent, agent_id)
+        if agent is None:
+            raise AgentNotFoundError(f"agent {agent_id} does not exist")
+        if agent.status == BUSY:
+            raise AgentUnavailableError(
+                f"agent {agent_id} is busy (another execution is in flight)"
+            )
+        if agent.status != AVAILABLE:
+            raise AgentUnavailableError(f"agent {agent_id} is not usable (status {agent.status!r})")
+        stmt = (
+            update(Agent)
+            .where(Agent.id == agent_id, Agent.status == AVAILABLE)
+            .values(status=BUSY, updated_at=_now_utc())
+        )
+        rowcount = session.execute(stmt).rowcount
+        if rowcount != 1:
+            raise AgentUnavailableError(
+                f"agent {agent_id} is not usable (status changed concurrently)"
+            )
+        session.refresh(agent)
+        logger.info(
+            "agent claimed for execution",
+            extra={"agent_id": str(agent_id), "status": BUSY},
+        )
+        return agent
+
+    def release_agent(
+        self, session: Session, agent_id: uuid.UUID, *, mark_error: bool = False
+    ) -> Agent:
+        """Release a BUSY agent back to AVAILABLE (or ERROR).
+
+        The update is conditional (``status = BUSY``), so releasing an agent
+        that is no longer BUSY is a safe no-op and can never free another
+        execution's claim. The caller must commit.
+        """
+        target = ERROR if mark_error else AVAILABLE
+        stmt = (
+            update(Agent)
+            .where(Agent.id == agent_id, Agent.status == BUSY)
+            .values(status=target, updated_at=_now_utc())
+        )
+        rowcount = session.execute(stmt).rowcount
+        agent = session.get(Agent, agent_id)
+        if agent is not None:
+            session.refresh(agent)
+        if rowcount == 1:
+            logger.info(
+                "agent released after execution",
+                extra={"agent_id": str(agent_id), "status": target},
+            )
+        return agent
