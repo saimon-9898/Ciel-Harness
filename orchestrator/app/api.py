@@ -1,9 +1,11 @@
-"""Projects and Tasks API routers (Phase 2/3).
+"""Projects, Tasks, and Agents API routers (Phase 2/3/4).
 
 Projects (Phase 2): management endpoints; workspaces are created eagerly on
 project creation; the WorkspaceService guarantees filesystem isolation.
 Tasks (Phase 3): task engine endpoints; all status changes are guarded by the
 deterministic state machine.
+Agents (Phase 4): agent registry endpoints; adapters report not-configured and
+no execution endpoint exists.
 """
 
 import logging
@@ -14,10 +16,28 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .agent_contracts import AgentHealth
+from .agent_errors import (
+    AgentError,
+    AgentNameConflictError,
+    AgentNotFoundError,
+    AgentUnavailableError,
+    InvalidAgentConfigurationError,
+    UnsupportedProviderError,
+)
+from .agent_manager import AgentManager
 from .config import get_settings
 from .db import get_session
-from .models import Project, Task
-from .schemas import ProjectCreate, ProjectOut, TaskCreate, TaskOut
+from .models import Agent, Project, Task
+from .schemas import (
+    AgentCreate,
+    AgentHealthOut,
+    AgentOut,
+    ProjectCreate,
+    ProjectOut,
+    TaskCreate,
+    TaskOut,
+)
 from .task_service import (
     InvalidParentTaskError,
     ParentTaskNotFoundError,
@@ -160,12 +180,12 @@ def list_project_tasks(
 tasks_router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 _TASK_ERROR_RESPONSES = {
-    404: {"description": "Task or parent task not found"},
+    404: {"description": "Task, parent task, or agent not found"},
     409: {
         "description": (
             "Invalid relationship or state conflict "
             "(cross-project parent, cycle, invalid/terminal transition, "
-            "or concurrent state change)"
+            "unusable agent, or concurrent state change)"
         )
     },
     422: {"description": "Validation error"},
@@ -184,6 +204,10 @@ def _task_http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
     if isinstance(exc, ParentTaskNotFoundError):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Parent task not found")
+    if isinstance(exc, AgentNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+    if isinstance(exc, AgentUnavailableError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     if isinstance(exc, (InvalidParentTaskError, TaskStateConflictError, TaskStateError)):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
@@ -202,20 +226,22 @@ def create_task(
 ) -> Task:
     """Create a task in state CREATED under an existing project.
 
-    Only creation fields are accepted; status, timestamps, result, error and
-    agent_id are server-controlled.
+    Only creation fields are accepted; status, timestamps, result and error
+    are server-controlled.  ``agent_id`` is an optional reference to an
+    existing usable agent; assigning never executes anything.
     """
     try:
         return tasks.create_task(
             session,
             project_id=payload.project_id,
             parent_task_id=payload.parent_task_id,
+            agent_id=payload.agent_id,
             objective=payload.objective,
             instructions=payload.instructions,
             constraints=payload.constraints,
             success_criteria=payload.success_criteria,
         )
-    except (TaskError, TaskStateError) as exc:
+    except (TaskError, TaskStateError, AgentError) as exc:
         raise _task_http_error(exc) from exc
 
 
@@ -255,3 +281,114 @@ def cancel_task(
         return tasks.cancel_task(session, task_id)
     except (TaskError, TaskStateError) as exc:
         raise _task_http_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Agents router (Phase 4)
+# ---------------------------------------------------------------------------
+
+agents_router = APIRouter(prefix="/agents", tags=["agents"])
+
+_AGENT_ERROR_RESPONSES = {
+    404: {"description": "Agent not found"},
+    409: {"description": "Agent name already exists"},
+    422: {"description": "Validation error (e.g. unknown provider or secret key)"},
+}
+
+
+def _agent_manager() -> AgentManager:
+    return AgentManager()
+
+
+def _agent_http_error(exc: Exception) -> HTTPException:
+    """Map Agent engine errors to their HTTP status."""
+    if isinstance(exc, AgentNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+    if isinstance(exc, AgentNameConflictError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, (InvalidAgentConfigurationError, UnsupportedProviderError)):
+        return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+
+@agents_router.post(
+    "",
+    response_model=AgentOut,
+    status_code=status.HTTP_201_CREATED,
+    responses=_AGENT_ERROR_RESPONSES,
+)
+def register_agent(
+    payload: AgentCreate,
+    session: Session = Depends(get_session),
+    agents: AgentManager = Depends(_agent_manager),
+) -> Agent:
+    """Register an agent definition.
+
+    The agent is created in state UNAVAILABLE: no provider is connected in
+    Phase 4, so claiming availability would be misleading.  No execution
+    endpoint exists.
+    """
+    try:
+        return agents.register_agent(
+            session,
+            name=payload.name,
+            provider=payload.provider,
+            capabilities=payload.capabilities,
+            configuration=payload.configuration,
+        )
+    except AgentError as exc:
+        raise _agent_http_error(exc) from exc
+
+
+@agents_router.get("", response_model=list[AgentOut])
+def list_agents(
+    session: Session = Depends(get_session),
+    agents: AgentManager = Depends(_agent_manager),
+) -> list[Agent]:
+    """List all registered agents, ordered deterministically."""
+    return agents.list_agents(session)
+
+
+@agents_router.get(
+    "/{agent_id}",
+    response_model=AgentOut,
+    responses={
+        "404": _AGENT_ERROR_RESPONSES[404],
+        "422": {"description": "Validation error"},
+    },
+)
+def get_agent(
+    agent_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    agents: AgentManager = Depends(_agent_manager),
+) -> Agent:
+    """Fetch a single agent definition by id."""
+    try:
+        return agents.get_agent(session, agent_id)
+    except AgentError as exc:
+        raise _agent_http_error(exc) from exc
+
+
+@agents_router.get(
+    "/{agent_id}/health",
+    response_model=AgentHealthOut,
+    responses={
+        "404": _AGENT_ERROR_RESPONSES[404],
+        "422": {"description": "Validation error"},
+    },
+)
+def get_agent_health(
+    agent_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    agents: AgentManager = Depends(_agent_manager),
+) -> AgentHealth:
+    """Probe the agent's provider adapter.
+
+    The probe runs and reports truthfully: Phase 4 adapters return
+    ``not_configured``.  A 200 response means the probe itself succeeded, not
+    that the provider is available.
+    """
+    try:
+        return agents.check_health(session, agent_id)
+    except AgentError as exc:
+        raise _agent_http_error(exc) from exc

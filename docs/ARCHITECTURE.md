@@ -18,20 +18,27 @@
 │                       │  - Projects CRUD (Phase 2)  │  │
 │                       │  - Workspace isolation      │  │
 │                       │  - Task engine (Phase 3)    │  │
+│                       │  - Agent abstraction (P4)   │  │
 │                       └───────┬────────────────────┘  │
-│                               │                      │
+│                               │  adapters report      │
+│                               │  not_configured       │
 │                       ┌───────▼────────────────────┐  │
 │                       │    Coding Agents            │  │
-│                       │  (OpenHands, etc. Phase 4+) │  │
+│                       │  (OpenHands, Claude Code,   │  │
+│                       │   Codex, Gemini — not       │  │
+│                       │   connected until Phase 5)  │  │
 │                       └────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
 ```
 
 **Phase 1** delivered the Orchestrator API box minus projects/workspaces.
 **Phase 2** added project management and workspace isolation.
-**Phase 3** adds the Task engine: a deterministic task state machine with
-creation, querying, and cancellation. No agent execution exists yet.
-No dashboard, no autonomous behaviour.
+**Phase 3** added the Task engine: a deterministic task state machine with
+creation, querying, and cancellation.
+**Phase 4** adds the Agent abstraction: a closed provider enum, strict
+contracts, an agent registry, honest non-fake adapters, a minimal
+agent-management API, and non-executing task→agent assignment. No provider is
+connected, no execution exists, no dashboard, no autonomous behaviour.
 
 ---
 
@@ -339,8 +346,8 @@ no event table or pub/sub exists yet.
 |------------|--------|------------------------|
 | `/health`  | GET    | Liveness probe         |
 
-The router include list is: `projects_router` (Phase 2) and `tasks_router`
-(Phase 3).
+The router include list is: `projects_router` (Phase 2), `tasks_router`
+(Phase 3), and `agents_router` (Phase 4).
 
 **Error handling:** A global `Exception` handler catches unhandled
 exceptions, logs them with structured logging, and returns a JSON 500
@@ -376,13 +383,142 @@ Shutdown:
 - Project names are validated by regex before becoming filesystem paths.
 - The `WorkspaceService` is the single chokepoint for all filesystem access
   and enforces path containment with `Path.resolve()` + `relative_to()`.
-- Task fields that control lifecycle (`status`, `result`, `agent_id`,
-  timestamps) cannot be written through the API — `TaskCreate` simply has no
-  such fields (mass-assignment protection by construction).
+- Task lifecycle fields (`status`, `result`, timestamps) cannot be written
+  through the API — `TaskCreate` simply has no such fields
+  (mass-assignment protection by construction). `agent_id` **is** a valid
+  input since Phase 4: it is validated (agent must exist and be usable)
+  rather than silently dropped.
+- Agent `status`, `id`, and timestamps are server-controlled; `AgentCreate`
+  has no such fields and the registry always starts agents `UNAVAILABLE`.
+- Agent configuration rejects secret-looking keys at the boundary and
+  `AgentOut` redacts them defensively; no plaintext secrets are stored.
+- Unknown providers and capabilities are rejected by closed enums.
 
 ---
 
-## Future integration: OpenHands
+## 10. Agent abstraction (Phase 4)
+
+The Agent layer is a provider-independent boundary between the Task Engine and
+coding-agent providers. **It performs no execution**: it registers agent
+definitions, resolves them to adapters, and probes health honestly.
+
+### 10.1 Provider vocabulary (`orchestrator/app/agent_providers.py`)
+
+- `AgentProvider` is a **closed `StrEnum`**: `openhands`, `claude_code`,
+  `codex`, `gemini`. Unknown provider strings are rejected at the API boundary
+  (422) and by `resolve_adapter` (`UnsupportedProviderError`).
+- `AgentCapability` is a closed `StrEnum`: `code`, `test`, `shell`, `git`,
+  `network`. Capabilities are **advertised only** in Phase 4; a later phase
+  must gate them at execution time.
+- Agent statuses are plain strings (`AVAILABLE`, `BUSY`, `UNAVAILABLE`,
+  `ERROR`, `DISABLED`). Only `AVAILABLE` is usable for task assignment
+  (`USABLE_AGENT_STATUSES`).
+- `validate_agent_configuration` enforces bounds (≤20 keys, keys ≤64 chars,
+  values ≤512 chars) and rejects secret-looking keys via a blocklist regex
+  (`api_key`, `token`, `secret`, `password`, `auth`, `private_key`, ...).
+- `redact_secrets` is defense-in-depth for responses: even if a secret key
+  reached the DB, `AgentOut` strips it.
+
+### 10.2 Contracts (`orchestrator/app/agent_contracts.py`)
+
+Strict Pydantic models define the execution boundary for Phase 5, with no
+provider-specific concepts leaking through:
+
+- `AgentTaskRequest` — what the engine would hand to an adapter (task/project
+  ids, objective, instructions, constraints, success criteria), all bounded.
+- `AgentTaskHandle` — **frozen** opaque provider-side reference; the engine
+  never inspects it.
+- `AgentExecutionState`, `AgentStatusResult`, `AgentResult` — provider-reported
+  status/result vocabulary.
+- `AgentHealthState` (`available`/`unavailable`/`error`/`not_configured`/
+  `unsupported`) and `AgentHealth` — probe results.
+
+### 10.3 Errors (`orchestrator/app/agent_errors.py`)
+
+`AgentError` base with typed subclasses: `AgentNotFoundError`,
+`AgentNameConflictError`, `UnsupportedProviderError`,
+`InvalidAgentConfigurationError`, `AgentUnavailableError`,
+`ProviderNotConfiguredError`, `AgentTimeoutError`, `AgentProviderError`,
+`AgentMalformedResponseError`, `AgentCancellationError`. No failure is ever
+converted into a success.
+
+### 10.4 Adapters (`orchestrator/app/adapters/`)
+
+`AgentAdapter` (ABC) defines the provider-independent interface:
+`check_health`, `start_task`, `get_status`, `get_result`, `cancel_task`.
+Four concrete adapters (one per provider) exist. **All are honest**:
+
+- `check_health` returns `AgentHealthState.NOT_CONFIGURED`.
+- Every execution method raises `ProviderNotConfiguredError`.
+
+No adapter fabricates a start, a status, or a result. Phase 5 will implement
+the real integrations behind these boundaries.
+
+### 10.5 Registry (`orchestrator/app/agent_manager.py`)
+
+- `ADAPTER_REGISTRY` maps each provider to its adapter class; `resolve_adapter`
+  raises `UnsupportedProviderError` for anything unknown.
+- `AgentManager.register_agent` validates provider and configuration, enforces
+  a unique name, and starts the record `UNAVAILABLE` — claiming availability
+  when no provider is connected would be fake.
+- `list_agents` is deterministic (ordered by name).
+- `check_health` resolves the adapter and runs its probe.
+- `get_agent_with_adapter` returns the abstraction, never a provider-specific
+  implementation.
+
+### 10.6 Agent model and API
+
+```python
+class Agent(Base):
+    __tablename__ = "agents"
+    id: Mapped[uuid.UUID]      # primary key
+    name: Mapped[str]          # unique, 1-100 chars
+    provider: Mapped[str]      # indexed, one of the closed enum values
+    status: Mapped[str]        # default "UNAVAILABLE"
+    capabilities: Mapped[list[str]]  # JSON, advertised only
+    configuration: Mapped[dict | None]  # JSON, non-secret settings only
+    created_at / updated_at: datetime
+```
+
+Agents are **global infrastructure** — they serve the whole orchestrator and
+are shared across projects. The model carries no project scope; Phase 5
+execution must verify workspace isolation per task assignment.
+
+| Endpoint                    | Method | Status | Description                              |
+|-----------------------------|--------|--------|------------------------------------------|
+| `/agents`                   | POST   | 201    | Register an agent (starts `UNAVAILABLE`) |
+| `/agents`                   | GET    | 200    | List agents (ordered by name)            |
+| `/agents/{agent_id}`        | GET    | 200    | Fetch one agent                          |
+| `/agents/{agent_id}/health` | GET    | 200    | Honest provider probe (`not_configured`) |
+
+There is **no execute endpoint**.
+
+### 10.7 Task→agent assignment (no execution)
+
+`TaskCreate.agent_id` and `TaskService.create_task(agent_id=...)` record a
+reference to an agent:
+
+1. `_validate_agent_assignment` checks the agent exists
+   (`AgentNotFoundError` → 404) and is `AVAILABLE`
+   (`AgentUnavailableError` → 409).
+2. The reference is stored on the task; the task stays in `CREATED`.
+
+No execution, polling, or cancellation is triggered by assignment. The endpoint
+catches `AgentError` alongside `TaskError`/`TaskStateError` so assignment
+failures map to clean HTTP errors instead of 500s.
+
+---
+
+## Phase 5: provider integration (future)
+
+Phase 4 deliberately left the provider integrations unbuilt. Phase 5 will:
+
+- Implement real connectivity behind each `AgentAdapter` (OpenHands first),
+  driven by the agent's `configuration`.
+- Introduce a secret-store for credentials — plaintext secrets are rejected
+  and never stored in Phase 4.
+- Drive task state transitions from adapter status/result calls.
+- Enforce per-task workspace isolation when executing.
 
 OpenHands provides:
 
@@ -391,8 +527,7 @@ OpenHands provides:
 - **Software Agent SDK:** Python and REST APIs for building agents that work
   with code. See https://docs.openhands.dev/sdk
 
-Phase 4+ will integrate one or both of these interfaces. No OpenHands
-dependency is installed in Phase 3.
+No provider dependency is installed in Phase 4.
 
 ---
 
@@ -421,12 +556,17 @@ dependency is installed in Phase 3.
 - The Task engine exposes only creation, listing, reading, and cancellation
   over HTTP. The full state machine is exercised internally by the service
   layer and covered by tests; agent execution that would drive those
-  transitions is out of scope for Phase 3.
+  transitions is out of scope (Phase 5).
 - `WAITING_FOR_APPROVAL` is reachable via the single added edge
   `WAITING_FOR_REVIEW -> WAITING_FOR_APPROVAL` (see section 8.2).
 - Self-parent and cycle relationships cannot be formed through the Phase 3
   API (no task-update endpoint); `TaskService` still validates and rejects
   them, and tests cover the guards directly.
+- **No agent execution in Phase 4**: every adapter reports `not_configured`;
+  no provider is connected; no secret-store exists (plaintext secrets are
+  rejected rather than stored).
+- Agents are global infrastructure; per-assignment workspace isolation must be
+  enforced by Phase 5 execution.
 - Workspace path checks have a TOCTOU gap (symlink swaps between resolution
   and use). Documented in detail in section 7; acceptable for single-user
   operation and mitigated by post-mkdir re-verification. Revisit before

@@ -6,6 +6,15 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .agent_contracts import AgentHealthState
+from .agent_providers import (
+    AGENT_STATUSES,
+    AgentCapability,
+    AgentProvider,
+    redact_secrets,
+    validate_agent_configuration,
+)
+
 # Project names become workspace directory names, so they must be safe as a
 # single path component: start with a letter or digit, then letters, digits,
 # '.', '_' or '-'. This rejects path separators, "..", and hidden names.
@@ -60,10 +69,14 @@ class TaskCreate(BaseModel):
     timestamps, result, error and agent_id are server-controlled and are not
     accepted here (they are either absent from this schema or ignored, and the
     created row always gets the server's values).
+
+    ``agent_id`` may reference an existing, usable agent.  Assigning an agent
+    **never executes anything** in Phase 4; it only records the reference.
     """
 
     project_id: uuid.UUID
     parent_task_id: uuid.UUID | None = None
+    agent_id: uuid.UUID | None = None
     objective: str = Field(min_length=1, max_length=_TASK_OBJECTIVE_MAX)
     instructions: str | None = Field(default=None, max_length=_TASK_INSTRUCTIONS_MAX)
     constraints: list[str] | None = Field(default=None, max_length=_TASK_LIST_MAX_ITEMS)
@@ -109,3 +122,90 @@ class TaskOut(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Agent schemas (Phase 4)
+# ---------------------------------------------------------------------------
+
+#: Maximum number of capability values an agent may advertise.
+_AGENT_CAPABILITIES_MAX = 10
+
+
+class AgentCreate(BaseModel):
+    """Payload for registering an agent.
+
+    Only operator-supplied fields are accepted: name, provider, capabilities,
+    and configuration.  Status, timestamps, and any internal provider state
+    are server-controlled and cannot be injected.
+    """
+
+    name: str = Field(min_length=1, max_length=100)
+    provider: AgentProvider
+    capabilities: list[AgentCapability] = Field(
+        default_factory=list, max_length=_AGENT_CAPABILITIES_MAX
+    )
+    configuration: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        if any(ord(ch) < 32 for ch in value):
+            raise ValueError("must not contain control characters")
+        return value
+
+    @field_validator("configuration")
+    @classmethod
+    def _configuration_validated(cls, value: dict[str, str]) -> dict[str, str]:
+        try:
+            return validate_agent_configuration(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+
+class AgentOut(BaseModel):
+    """Agent representation returned by the API.
+
+    Secret-looking configuration keys are redacted defensively, even though
+    the create schema already rejects them.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    provider: str
+    status: str
+    capabilities: list[str]
+    configuration: dict[str, str]
+    created_at: datetime
+    updated_at: datetime
+
+    @field_validator("configuration", mode="before")
+    @classmethod
+    def _redact(cls, value: dict[str, str] | None) -> dict[str, str]:
+        return redact_secrets(value)
+
+    @field_validator("status")
+    @classmethod
+    def _status_validated(cls, value: str) -> str:
+        if value not in AGENT_STATUSES:
+            raise ValueError(f"unknown agent status {value!r}")
+        return value
+
+
+class AgentHealthOut(BaseModel):
+    """Structured result of a health probe, as returned by the API.
+
+    ``status`` is the probe result (available/unavailable/error/
+    not_configured/unsupported), distinct from the agent's stored lifecycle
+    status.
+    """
+
+    agent_id: uuid.UUID
+    provider: AgentProvider
+    status: AgentHealthState
+    detail: str = Field(default="", max_length=2000)
+    checked_at: datetime

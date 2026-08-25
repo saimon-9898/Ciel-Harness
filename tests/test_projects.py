@@ -348,11 +348,18 @@ def test_openapi_schema_exposes_all_routes(client):
         "/tasks/{task_id}",
         "/tasks/{task_id}/cancel",
         "/projects/{project_id}/tasks",
+        "/agents",
+        "/agents/{agent_id}",
+        "/agents/{agent_id}/health",
     }
     assert "post" in schema["paths"]["/projects"]
     assert "get" in schema["paths"]["/projects"]
     assert "get" in schema["paths"]["/projects/{project_id}"]
     assert "get" in schema["paths"]["/health"]
+    assert "post" in schema["paths"]["/agents"]
+    assert "get" in schema["paths"]["/agents"]
+    assert "get" in schema["paths"]["/agents/{agent_id}"]
+    assert "get" in schema["paths"]["/agents/{agent_id}/health"]
 
 
 def test_openapi_declares_error_responses(client):

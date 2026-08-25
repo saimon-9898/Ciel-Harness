@@ -4,8 +4,10 @@ Phase 1 scope: application lifecycle, structured logging, configuration,
 database initialization, error handling foundation, and a liveness endpoint.
 Phase 2 adds project management and workspace isolation.
 Phase 3 adds the Task engine: tasks are created, transitioned through a
-deterministic state machine, queried, and cancelled. No agent execution or
-automation exists yet.
+deterministic state machine, queried, and cancelled.
+Phase 4 adds the Agent abstraction: provider-independent adapters, an agent
+registry, health probes, and task->agent assignment. No agent execution or
+automation exists yet — adapters report not-configured.
 """
 
 import logging
@@ -14,8 +16,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .api import agents_router, tasks_router
 from .api import router as projects_router
-from .api import tasks_router
 from .config import get_settings, settings
 from .db import dispose_engine, init_db
 from .logging_config import setup_logging
@@ -54,12 +56,13 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="Backend foundation for orchestrating coding agents (Phase 3).",
+    description="Backend foundation for orchestrating coding agents (Phase 4).",
     lifespan=lifespan,
 )
 
 app.include_router(projects_router)
 app.include_router(tasks_router)
+app.include_router(agents_router)
 
 
 @app.exception_handler(Exception)

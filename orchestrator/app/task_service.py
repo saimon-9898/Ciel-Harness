@@ -6,8 +6,9 @@ concurrent transitions of the same task cannot both succeed: exactly one wins
 and the loser receives ``TaskStateConflictError``. No code path in this module
 sets ``status`` directly on an object and commits without that guard.
 
-Phase 3 performs no agent execution. ``agent_id`` is stored for future use and
-never populated here.
+Phase 4 records a task->agent reference: ``agent_id`` is validated (the agent
+must exist and be usable) but never executed. No code path in this module
+starts, polls, or cancels work on an agent.
 """
 
 import logging
@@ -17,7 +18,9 @@ from datetime import UTC, datetime
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from .models import Project, Task
+from .agent_errors import AgentNotFoundError, AgentUnavailableError
+from .agent_providers import is_usable_agent_status
+from .models import Agent, Project, Task
 from .task_states import (
     CANCELLED,
     COMPLETED,
@@ -71,10 +74,18 @@ class TaskService:
         instructions: str | None,
         constraints: list[str] | None,
         success_criteria: list[str],
+        agent_id: uuid.UUID | None = None,
     ) -> Task:
-        """Create a task in state CREATED under an existing project."""
+        """Create a task in state CREATED under an existing project.
+
+        ``agent_id`` records a reference to an existing, usable agent.  It is
+        **never executed**: Phase 4 assignment only stores the reference and
+        the task remains in CREATED.
+        """
         if session.get(Project, project_id) is None:
             raise ProjectNotFoundError(f"project {project_id} does not exist")
+        if agent_id is not None:
+            self._validate_agent_assignment(session, agent_id)
 
         task = Task(
             id=uuid.uuid4(),
@@ -85,6 +96,7 @@ class TaskService:
             constraints=constraints,
             success_criteria=success_criteria,
             status="CREATED",
+            agent_id=agent_id,
         )
         if parent_task_id is not None:
             self._validate_parent(session, task, parent_task_id)
@@ -213,6 +225,19 @@ class TaskService:
             },
         )
         return task
+
+    def _validate_agent_assignment(self, session: Session, agent_id: uuid.UUID) -> None:
+        """Validate a task->agent reference without executing anything.
+
+        The agent must exist and be usable (AVAILABLE).  Nonexistent agents
+        raise :class:`AgentNotFoundError`; unavailable/busy/error/disabled
+        agents raise :class:`AgentUnavailableError`.
+        """
+        agent = session.get(Agent, agent_id)
+        if agent is None:
+            raise AgentNotFoundError(f"agent {agent_id} does not exist")
+        if not is_usable_agent_status(agent.status):
+            raise AgentUnavailableError(f"agent {agent_id} is not usable (status {agent.status!r})")
 
     def _validate_parent(self, session: Session, task: Task, parent_task_id: uuid.UUID) -> None:
         """Enforce parent-task rules: exists, same project, no self/cycle."""

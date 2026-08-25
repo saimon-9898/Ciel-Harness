@@ -10,6 +10,8 @@ import uuid
 
 import pytest
 
+from app.agent_errors import AgentNotFoundError, AgentUnavailableError
+from app.agent_providers import AVAILABLE, BUSY, DISABLED, ERROR, UNAVAILABLE
 from app.db import get_session_factory
 from app.models import Project, Task
 from app.task_service import (
@@ -476,3 +478,81 @@ def test_concurrent_duplicate_cancels_are_safe(client):
         assert all(s == CANCELLED for s in statuses)
     finally:
         final_session.close()
+
+
+# ---------- task -> agent assignment (Phase 4) ----------
+
+
+def _register_agent(session, name="svc-agent", status=UNAVAILABLE):
+    from app.agent_manager import AgentManager
+    from app.agent_providers import AgentCapability, AgentProvider
+
+    agent = AgentManager().register_agent(
+        session,
+        name=name,
+        provider=AgentProvider.OPENHANDS,
+        capabilities=[AgentCapability.CODE],
+    )
+    if status != UNAVAILABLE:
+        agent.status = status
+        session.commit()
+    return agent
+
+
+def test_create_task_with_unknown_agent_raises(client):
+    session = _new_session()
+    project = _create_project(session)
+    try:
+        with pytest.raises(AgentNotFoundError):
+            service.create_task(
+                session,
+                **_task_payload(project.id, agent_id=uuid.uuid4()),
+            )
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("status", [BUSY, UNAVAILABLE, ERROR, DISABLED])
+def test_create_task_with_unusable_agent_raises(client, status):
+    session = _new_session()
+    project = _create_project(session)
+    agent = _register_agent(session, status=status)
+    try:
+        with pytest.raises(AgentUnavailableError):
+            service.create_task(
+                session,
+                **_task_payload(project.id, agent_id=agent.id),
+            )
+    finally:
+        session.close()
+
+
+def test_create_task_with_available_agent_records_reference_without_execution(client):
+    """Assignment stores the reference and runs nothing.
+
+    The adapter's execution methods all raise ProviderNotConfiguredError, so
+    if any code path attempted to start, poll, or cancel work this test would
+    fail loudly.  The created task remains in CREATED.
+    """
+    session = _new_session()
+    project = _create_project(session)
+    agent = _register_agent(session, status=AVAILABLE)
+    try:
+        task = service.create_task(session, **_task_payload(project.id, agent_id=agent.id))
+        assert task.status == CREATED
+        assert task.agent_id == agent.id
+        # No execution artifacts exist.
+        assert task.started_at is None
+        assert task.completed_at is None
+        assert task.result is None
+        assert task.error is None
+        # The reference survives a fresh read from the DB.
+        fresh = _new_session()
+        try:
+            row = fresh.get(Task, task.id)
+            assert row.agent_id == agent.id
+            assert row.status == CREATED
+        finally:
+            fresh.close()
+    finally:
+        session.close()

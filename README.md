@@ -1,8 +1,8 @@
-# AI CTO Hub — Phase 3: Task Engine
+# AI CTO Hub — Phase 4: Agent Abstraction
 
 A self-hosted AI coding-agent orchestration platform. This repository contains
-the backend foundation that will later orchestrate OpenHands and other coding
-agents.
+the backend foundation that will later orchestrate OpenHands, Claude Code,
+Codex, and Gemini coding agents.
 
 **Phase 1 delivered:** a minimal FastAPI backend with structured logging,
 database initialization, configuration, error handling, a liveness endpoint,
@@ -12,12 +12,17 @@ and Docker infrastructure.
 security-hardened workspace service that gives every project its own isolated
 directory on disk.
 
-**Phase 3 delivers:** the Task engine — tasks are created under a project,
+**Phase 3 delivered:** the Task engine — tasks are created under a project,
 transitioned through a deterministic state machine, queried, and cancelled.
-There is **no agent execution yet**: tasks are stored and tracked only; nothing
-runs them.
 
-No agent execution, no autonomous mode, and no dashboard are implemented yet.
+**Phase 4 delivers:** the provider-independent Agent abstraction — a closed
+provider enum, strict Pydantic contracts, an Agent model, an agent
+registry/manager, honest non-fake adapters (they report `not_configured`), a
+minimal agent-management API, and non-executing task→agent assignment.
+
+There is **no agent execution yet**: adapters exist as honest boundaries and
+report `not_configured`; nothing connects to a real provider; no task ever
+runs on an agent. No autonomous mode and no dashboard are implemented yet.
 
 ---
 
@@ -234,6 +239,75 @@ receives `409`.
 | Malformed UUID, missing/oversized/blank fields         | `422`       |
 | Invalid parent (missing, other project, self, cycle)   | `409`       |
 | Illegal or conflicting state transition                | `409`       |
+| Assigned agent does not exist                          | `404`       |
+| Assigned agent is not usable (status ≠ `AVAILABLE`)    | `409`       |
+
+---
+
+## Agents API
+
+| Endpoint                   | Method | Description                                    |
+|----------------------------|--------|------------------------------------------------|
+| `/agents`                  | POST   | Register an agent definition                    |
+| `/agents`                  | GET    | List all agents (ordered by name)               |
+| `/agents/{agent_id}`       | GET    | Fetch a single agent by UUID                    |
+| `/agents/{agent_id}/health`| GET    | Probe the agent's provider adapter              |
+
+**There is no execute endpoint.** Phase 4 registers agent *definitions* only;
+nothing runs a task on an agent.
+
+### Register an agent
+
+```bash
+curl -X POST http://localhost:8000/agents \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "my-openhands",
+        "provider": "openhands",
+        "capabilities": ["code", "test"],
+        "configuration": {"model": "sonnet"}
+      }'
+```
+
+```json
+{
+  "id": "8f2c...uuid...",
+  "name": "my-openhands",
+  "provider": "openhands",
+  "status": "UNAVAILABLE",
+  "capabilities": ["code", "test"],
+  "configuration": {"model": "sonnet"},
+  "created_at": "2026-08-25T11:00:00Z",
+  "updated_at": "2026-08-25T11:00:00Z"
+}
+```
+
+Key behaviors:
+
+- **Supported providers** (closed enum): `openhands`, `claude_code`, `codex`,
+  `gemini`. Anything else is rejected with `422`.
+- **Agents start `UNAVAILABLE`.** No provider is connected in Phase 4, so an
+  agent never claims to be available.
+- **No secrets.** Configuration keys that look like credentials (`api_key`,
+  `token`, `secret`, `password`, `auth`, ...) are rejected with `422`, and
+  responses redact them defensively.
+- **Global scope.** Agents are infrastructure shared across projects. Phase 5
+  execution must enforce per-assignment workspace isolation.
+- **Health probes are truthful.** `/agents/{id}/health` reports
+  `not_configured` for every provider; a `200` means the probe itself ran,
+  not that the provider is reachable.
+
+### Assigning an agent to a task
+
+`POST /tasks` accepts an optional `agent_id`. Assignment validates that the
+agent exists and is usable, but **never executes anything** — the task simply
+records the reference and stays in `CREATED`.
+
+| Condition                                        | HTTP status |
+|--------------------------------------------------|-------------|
+| Agent does not exist                             | `404`       |
+| Agent exists but status is not `AVAILABLE`       | `409`       |
+| No `agent_id` supplied                           | `201` (no agent) |
 
 ---
 
@@ -301,22 +375,31 @@ ai-cto/
 │   └── app/
 │       ├── __init__.py
 │       ├── main.py            # FastAPI app, routes, error handlers
-│       ├── api.py             # Projects + Tasks API routers
+│       ├── api.py             # Projects + Tasks + Agents API routers
 │       ├── config.py          # Pydantic-settings configuration
 │       ├── db.py              # SQLAlchemy engine, session, helpers
 │       ├── logging_config.py  # Structured JSON logging
-│       ├── models.py          # Project + Task models
+│       ├── models.py          # Project, Task, and Agent models
 │       ├── schemas.py         # Pydantic request/response schemas
 │       ├── task_states.py     # Task state machine (transitions, guards)
 │       ├── task_service.py    # TaskService (create/query/transition/cancel)
-│       └── workspaces.py      # WorkspaceService (path isolation)
+│       ├── workspaces.py      # WorkspaceService (path isolation)
+│       ├── agent_providers.py # Provider/capability enums, config validation
+│       ├── agent_contracts.py # Strict agent data contracts
+│       ├── agent_errors.py    # Agent exception hierarchy
+│       ├── agent_manager.py   # Agent registry + adapter resolution
+│       └── adapters/          # AgentAdapter boundary + 4 honest adapters
 ├── tests/
 │   ├── conftest.py            # Shared test fixtures
 │   ├── test_health.py         # Phase 1 test suite
 │   ├── test_projects.py       # Project + workspace isolation tests
 │   ├── test_task_states.py    # State machine tests
-│   ├── test_task_service.py   # Service-level Task tests
-│   └── test_tasks_api.py      # Tasks API + adversarial tests
+│   ├── test_task_service.py   # Service-level Task + agent-assignment tests
+│   ├── test_tasks_api.py      # Tasks API + adversarial tests
+│   ├── test_agent_providers.py# Provider enum + config validation tests
+│   ├── test_agent_contracts.py# Agent data contract tests
+│   ├── test_agent_manager.py  # Registry/adapter/health tests
+│   └── test_agents_api.py     # Agents API + OpenAPI contract tests
 ├── data/                      # SQLite database (gitignored, bind-mounted)
 ├── projects/                  # Per-project workspaces (gitignored, bind-mounted)
 └── logs/                      # Reserved for future use
@@ -332,17 +415,25 @@ ai-cto/
 - The `.env` file is gitignored; only `.env.example` is tracked.
 - Filesystem access is mediated by `WorkspaceService`; API parameters can
   never become unrestricted filesystem paths.
+- Agent configuration never stores plaintext secrets: secret-looking keys
+  (`api_key`, `token`, `password`, ...) are rejected at the API boundary, and
+  `AgentOut` redacts them defensively even if one reached the database.
+- Agent `status`, `id`, and timestamps are server-controlled; mass-assignment
+  attempts are ignored and covered by regression tests.
+- Unknown agent providers and capabilities are rejected by a closed enum;
+  unsupported stored providers fail safely.
 
 ---
 
-## Known limitations (Phase 3)
+## Known limitations (Phase 4)
 
 - Docker is not installed on the current development machine — the Dockerfile
   and docker-compose.yml are syntactically validated but not run. The
   Dockerfile layout (working directory `/app`, `app/` package, `data/` and
   `projects/` bind mounts) was validated by running the app from an identical
   local layout with `uvicorn`.
-- **No agent execution**: tasks are stored and tracked; nothing executes them.
+- **No agent execution**: adapters exist but every provider reports
+  `not_configured`; no provider connection, no execution, no autonomous mode.
 - **No task-update endpoint**: the state machine is advanced only by internal
   service calls, and only creation + cancellation are exposed over HTTP.
 - `WAITING_FOR_APPROVAL` is reachable only from `WAITING_FOR_REVIEW` (a single
@@ -353,7 +444,9 @@ ai-cto/
 - SQLite is the only database driver provided; PostgreSQL requires a driver
   (`psycopg`) in a later phase. The Task engine uses plain SQLAlchemy Core
   UPDATE statements, so the compare-and-swap works unchanged on PostgreSQL.
-- OpenHands is not integrated; the architecture doc notes its REST API / SDK
-  for future reference.
+- OpenHands, Claude Code, Codex, and Gemini are **not integrated**; the
+  adapters are honest boundaries that report `not_configured`.
+- Agents are global infrastructure; Phase 5 execution must enforce per-task
+  workspace isolation when running an agent.
 - Workspace path checks are synchronous and not race-free against concurrent
   symlink swaps (TOCTOU); revisit before untrusted multi-user use.

@@ -160,7 +160,12 @@ def test_create_task_parent_must_be_uuid(client):
 
 
 def test_mass_assignment_is_ignored(client):
-    """A client cannot set status, result, agent_id or timestamps."""
+    """A client cannot set status, result or timestamps.
+
+    ``agent_id`` is excluded here: it is a validated input in Phase 4, so an
+    unknown value fails with 404 (covered by the assignment tests) instead of
+    being silently dropped.  Only true read-only fields are forged below.
+    """
     pid = _create_project(client)
     fake_time = "2020-01-01T00:00:00"
     resp = _c(client).post(
@@ -172,7 +177,6 @@ def test_mass_assignment_is_ignored(client):
             "status": "COMPLETED",
             "result": "fake result",
             "error": "fake error",
-            "agent_id": str(uuid.uuid4()),
             "created_at": fake_time,
             "started_at": fake_time,
             "completed_at": fake_time,
@@ -480,3 +484,43 @@ def test_task_out_schema_matches_runtime(client):
         "updated_at",
     }
     assert set(task.keys()) == props
+
+
+# ---------- task -> agent assignment (Phase 4) ----------
+
+
+def _register_agent(client, name="api-agent", provider="openhands"):
+    resp = _c(client).post(
+        "/agents",
+        json={"name": name, "provider": provider, "capabilities": ["code"]},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def test_create_task_with_unknown_agent_returns_404(client):
+    pid = _create_project(client)
+    resp = _c(client).post(
+        "/tasks",
+        json=_task_body(pid, agent_id=str(uuid.uuid4())),
+    )
+    assert resp.status_code == 404, resp.text
+
+
+def test_create_task_with_unusable_agent_returns_409(client):
+    """Registered agents start UNAVAILABLE, so assignment is refused."""
+    pid = _create_project(client)
+    agent = _register_agent(client)
+    resp = _c(client).post(
+        "/tasks",
+        json=_task_body(pid, agent_id=agent["id"]),
+    )
+    assert resp.status_code == 409, resp.text
+    assert "not usable" in resp.text
+
+
+def test_create_task_without_agent_still_succeeds(client):
+    pid = _create_project(client)
+    resp = _c(client).post("/tasks", json=_task_body(pid))
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["agent_id"] is None
